@@ -1,0 +1,185 @@
+---
+title: "Grant Report Ending 2015"
+author: "Alexander Tuzhikov"
+date: "December 21, 2015"
+output: 
+  html_document: 
+    fig_caption: yes
+    fig_height: 9
+    fig_width: 12
+    keep_md: yes
+    number_sections: yes
+    toc: yes
+---
+
+#Report
+
+##Libraries
+```{r libraries and preparation, warning=FALSE, message=FALSE, results="hide"}
+source("R/helper.R")
+library(gbra)
+source("R/pander.lib.R")
+source("R/yr.lib.R")
+source("R/data.table.lib.R")
+source("R/reshape2.lib.R")
+source("R/data.table.lib.R")
+source("R/scales.lib.R")
+report.2015<- function(file=""){
+  return(paste("report.2015", file, sep="/"))
+}
+
+if(!file.exists(report.2015())){
+  dir.create(report.2015())
+}
+```
+
+##A list of all organisms from the database:
+
+```{r legend}
+legend<- read.table(file=sixtyseven.genomes.dir("legend.txt"), sep = "\t", stringsAsFactors = FALSE, header = TRUE)
+legend %>% 
+  mutate(nubmer=1:nrow(legend)) %>% 
+  rename(`database id`=id_genomes, `genome name`=name) -> report.legend
+pander(report.legend, caption = "Genome List")
+write.table(x=report.legend, file=report.2015("legend.txt"), sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+## Core/non-core distribution per gene
+```{r core gene distribution}
+load(sixtyseven.genomes.dir("core.distribution.data.rda"))
+expand.df(core.distribution.data) -> core.distribution.data
+core.distribution.data.melt<- melt(core.distribution.data, id.vars = c("QUERY_ORF_ID","ID_QUERY_GENOME"))
+core.distribution.data.melt %>% group_by(ID_QUERY_GENOME, QUERY_ORF_ID, value) %>% summarize(total.grouping=n()) -> core.distribution.data.melt.summary
+#always core
+instate<- function(df){
+  cores<- df %>% filter(value=="core") %>% select(total.grouping)
+  outsiders<- df %>% filter(value=="outsider") %>% select(total.grouping)
+  noseps<- df %>% filter(value=="nosep") %>% select(total.grouping)
+  if(noseps==61){
+    return(data.frame(ID_QUERY_GENOME= df$ID_QUERY_GENOME[1], QUERY_ORF_ID=df$QUERY_ORF_ID[1], state="never separates"))
+  }
+  if(cores+noseps==61){
+    return(data.frame(ID_QUERY_GENOME= df$ID_QUERY_GENOME[1], QUERY_ORF_ID=df$QUERY_ORF_ID[1], state="always core"))
+  }
+  if(cores+noseps==60){
+    return(data.frame(ID_QUERY_GENOME= df$ID_QUERY_GENOME[1], QUERY_ORF_ID=df$QUERY_ORF_ID[1], state="outsider once"))
+  }else{
+    return(data.frame(ID_QUERY_GENOME= df$ID_QUERY_GENOME[1], QUERY_ORF_ID=df$QUERY_ORF_ID[1], state="outsider multiple"))
+  }
+}
+if(!file.exists(report.2015("df.list.rda"))){
+  df.list<- list()
+  core.distribution.data.melt.summary %>% 
+    group_by(ID_QUERY_GENOME, QUERY_ORF_ID) %>% 
+    do({
+      dl<-instate(.)
+      df.list[[length(df.list)+1]]<<- dl
+      return(NA)
+    })
+  save(df.list, file = report.2015("df.list.rda"))
+}else{
+  load(file=report.2015("df.list.rda"))
+}
+
+#turns out this is the fastes way
+if(!file.exists(report.2015("core.distribution.data.melt.summary.total.txt"))){
+  for(i in 1:length(df.list)){
+    line<- paste(df.list[[i]][[1]], df.list[[i]][[2]], as.character(df.list[[i]][[3]]), sep="\t", collapse = "\n")
+    write(line,file=report.2015("core.distribution.data.melt.summary.total.txt"), append=TRUE)
+  }
+}
+core.distribution.data.melt.summary.total<- fread(input = report.2015("core.distribution.data.melt.summary.total.txt"), sep = "\t", data.table = FALSE, col.names = c("ID_QUERY_GENOME", "QUERY_ORF_ID", "state"))
+
+core.distribution.data.melt.summary.total %>%
+  group_by(ID_QUERY_GENOME, state) %>% 
+  summarize(ammount=n()) %>%
+  group_by(ID_QUERY_GENOME) %>%
+  do({
+    df<-.
+    df$ratio<- rescale(.$ammount,from = c(0,sum(.$ammount)), to=c(0, 100))
+    return(df)
+  }) %>%
+  merge(x=., y=legend, by.x="ID_QUERY_GENOME", by.y="id_genomes")-> core.distribution.data.melt.summary.total.ratio
+write.table(x = core.distribution.data.melt.summary.total.ratio, file=report.2015("core.distribution.data.melt.summary.total.ratio.txt"), sep="\t", quote = FALSE)
+pander(core.distribution.data.melt.summary.total.ratio, caption = "Distribution of gene occurances in core and non-core")
+```
+
+##Separation ratio per genome
+```{r separation ratio}
+model.df<- read.table(file=sixtyseven.genomes.dir("model.df.txt"), sep="\t", header=TRUE)
+model.df %>% select(query.genome, target.genome, rsquared) %>% 
+  mutate(separation=rsquared>=0.73) %>% select(query.genome, separation) %>%
+  group_by(query.genome, separation) %>% summarize(separation.sum=n()) %>% group_by(query.genome) %>% do({
+    df<-.
+    df$separation.ratio<- rescale(df$separation.sum, from=c(0,sum(df$separation.sum)), to=c(0,100))
+    return(df)
+  }) -> model.df
+write.table(x=model.df, file=report.2015("separation.per.genome.txt"), sep="\t", quote = FALSE)
+```
+
+##Drosophila vs Wolbachia Plot Update
+
+```{r dros wold plot}
+legend %>% filter(id_genomes!=23) %>% 
+  filter(id_genomes!=40) %>% 
+  filter(id_genomes!=47) %>%
+  filter(id_genomes!=57) %>%
+  filter(id_genomes!=63) %>%
+  filter(id_genomes!=64) %>%
+  select(name, id_genomes) -> legend
+load(sixtyseven.genomes.dir("bh.data.normal.rda"))
+gp<- gen.pca(df = select.genomes(g.ids = c(3,6), df = bh.data.norm), legend = legend, g.ids = c(3, 6))
+gp
+
+png(filename = report.2015("dros.wolb.pca.png"), width = 700, heigh= 700)
+gp
+dev.off()
+```
+
+##Amoeba and its viruses
+
+```{r amoeba virus}
+gp<- gen.pca(df = select.genomes(g.ids = c(55, 58, 59), df = bh.data.norm), legend = legend, g.ids = c(55, 58, 59))
+gp
+png(filename = report.2015("amoeb.virus.pca.png"), width = 700, heigh= 700)
+gp
+dev.off()
+```
+
+##Drosophila separation plot
+
+```{r dros distro}
+model.df<-read.table(file = sixtyseven.genomes.dir("model.df.txt"), sep="\t", stringsAsFactors = FALSE, header = TRUE)
+#plot the distribution of rsquareds
+rsq.plot<- model.df %>% arrange(rsquared) %>% ggplot(data=., mapping=aes(x=rescale_max(as.numeric(factor(file.name, levels=file.name))), y= rsquared)) + 
+  geom_line(color="red") + xlab("Model number (scaled)") + ylab("R squared") + theme_bw()
+rsq.plot
+png(file=report.2015("rsq.plot.png"), width = 700, height= 700)
+rsq.plot
+dev.off()
+
+rsq.bar<- core.distribution.data %>% select.genomes(df=., g.ids=6) %>% mutate(id=rownames(.)) %>% melt(id.vars="id") %>% group_by(variable,value) %>%
+  summarise(times=n()) %>% do({
+    .$times<- rescale(.$times, from = c(0,sum(.$times)),to = c(0,1))
+    return(.)
+  }) %>% ungroup() %>% mutate(variable=str_replace_all(string=.$variable, pattern ="X", replacement="")) %>%
+  merge(x=., y=legend, by.x="variable", by.y="id_genomes") %>% 
+  merge(x=., y=filter(model.df,query.genome==6|target.genome==6) %>% mutate(variable=sapply(1:nrow(.),function(x){
+    if(.$target.genome[x]==6){
+      return(.$query.genome[x])
+    }else{
+      return(.$target.genome[x])
+    }
+  }))) %>% arrange(rsquared) %>% 
+  mutate(name=str_trim(toupper(str_replace_all(string=.$name, pattern = "\\.fasta|_|complete_genome|chromosome", replacement=" ")))) %>%
+  mutate(name=factor(.$name, levels=unique(.$name))) %>%
+  ggplot(data=., mapping=aes(x=name, y=times, group=variable, fill=value, order=value)) +geom_bar(stat="identity") + 
+  theme_bw() + theme(axis.text.x=element_text(angle=45, hjust=1),plot.margin = unit(c(1, 1, 1, 4), "cm")) +
+  xlab("Genome") + ylab("Core/Outsider Ratio") + labs(title="Drosophila Core/Outsider Gene Classification") +
+  geom_segment(mapping=aes(x=1, xend=nrow(legend)-1, y=0.1, yend=0.1), arrow=arrow(length=unit(0.5,"cm")),colour="red") +
+  scale_fill_manual(values=c("#06960B","#999999","#F7728A"),labels=c("Core Genes","No Clear Separation","Outsider Genes"), guide=guide_legend(title=""))
+plot(rsq.bar)
+png(file=report.2015("core.outsider.barplot.png"),width=1200, height=700)
+plot(rsq.bar)
+dev.off()
+```

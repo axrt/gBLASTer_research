@@ -1,0 +1,45 @@
+---
+title: "Genome Reference"
+author: "Alex T"
+date: "9/24/2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libs}
+library('XML')
+library('dplyr')
+library('seplyr')
+library('stringr')
+library('seqinr')
+```
+
+
+```{r data}
+driver<- xmlParse(file = 'driver.xml')
+driver.list<- xmlToList(driver)
+genome.info<- cbind(
+  NAME=sapply(3:71, x:={driver.list[x]$Genome$Name}),
+  PATH=sapply(3:71, x:={driver.list[x]$Genome$PathToFile})) %>% 
+  data.frame %>% mutate(PATH = str_replace_all(string = PATH, 
+                                               pattern='.home.alext.Documents.Research.gBLASTer.', 
+                                               replacement='')) %>%
+  filter(PATH!='NULL')
+fasta.ids<- sapply(
+  genome.info$PATH,
+  x:={
+    x<- readLines(x)
+    output<- grep('>', x, fixed=TRUE)
+    return(x[output])
+  }
+)
+sapply(
+  1:length(fasta.ids),
+  x:={as.character(str_replace_all(string = fasta.ids[x][[1]], pattern='>', replacement = ''))}
+) -> fasta.ids.fixed
+fasta.ids.fixed %>% unlist %>% writeLines(con = 'genomes.gis.txt')
+```
+

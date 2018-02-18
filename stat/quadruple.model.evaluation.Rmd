@@ -1,0 +1,501 @@
+---
+title: "Quadruple Model Evaluation"
+author: "Alexander Tuzhikov"
+date: "September 13, 2016"
+output: 
+  html_document: 
+    fig_caption: yes
+    fig_height: 9
+    fig_width: 12
+    highlight: haddock
+    keep_md: yes
+    number_sections: yes
+    theme: cosmo
+    toc: yes
+---
+
+```{r libs}
+#compile gbra to ensure it's up to date
+library(devtools)
+install_github("axrt/gbra")
+library(gbra)
+source("R/helper.R")
+sixtyseven.genomes<-"67.genomes"
+model.df.file<- "model.df.txt"
+bh.data.raw.file<- "bh.data.raw.rda"
+bh.data.normal.file<- "bh.data.normal.rda"
+library(doMC)
+library(doParallel)
+library(foreach)
+library(ggplot2)
+library(data.table)
+Rsq.cutoff<- 0.73
+logfile<- "log.txt"
+library(plyr)
+library(dplyr)
+library(ggbiplot)
+```
+```{r data prep}
+legend<- read.table(file=sixtyseven.genomes.dir("legend.txt"), sep="\t", header=TRUE, stringsAsFactors = FALSE) %>% 
+  filter(id_genomes!=23) %>% 
+  filter(id_genomes!=40) %>% 
+  filter(id_genomes!=47) %>%
+  filter(id_genomes!=57) %>%
+  filter(id_genomes!=63) %>%
+  filter(id_genomes!=64) %>%
+  select(name, id_genomes) %>%
+  arrange(id_genomes)
+load(sixtyseven.genomes.dir(bh.data.raw.file))
+bh.data%>% 
+    as.data.frame() %>%
+    restrict.minimal.hits(minhit = 4) %>%
+    normalize.scores() %>%
+    attach.genomeid.header() %>%
+    sign.bh.table() -> bh.data.norm
+rm(bh.data) #saves ram quite a bit
+model.driver<- create.model.driver(legend)
+```
+```{r model training}
+registerDoMC(cores=6)
+models<- foreach(i=1:nrow(model.driver)) %dopar%{
+  
+  org.pair<- c(model.driver$X1[i], model.driver$X2[i])
+  out.file<- sixtyseven.genomes.quadruple.model.models(paste0(org.pair[1], "_", org.pair[2],".rds"))
+  if(file.exists(out.file)){
+    return(out.file)
+  }
+  message(paste("Doing", org.pair[1], "::", org.pair[2]))
+  
+  model.list<- list()
+  
+  coocked.data<- bh.data.norm %>% select.genome.data(org.pair) %>%
+      filter.genome.data(org.pair) %>% 
+      append.cluster %>% data.frame
+  
+  for(x in 1:4){
+    model.dough<- coocked.data %>% sample.data.2()
+    
+    f<- get.glm.formula(model.dough$train)
+    model<- glm(formula = f, data=model.dough$train, family="binomial")
+    model<-step(model, trace = FALSE, direction = "backward")
+    
+    if(get.rsq(model)>=Rsq.cutoff){
+      message(paste("Model for", org.pair[1], "::", org.pair[2], "OK in attempt", x))
+      model$predicted<- (model %>% predict.clusters(data.rest=model.dough$validate))[,c("cluster", "predicted")]
+      message(table(model$predicted$cluster, model$predicted$predicted))
+      model.list[[x]]<- model
+    } else {
+      message(paste("Bad model encountered for",org.pair[1], "::", org.pair[2], "OK in attempt", x))
+      break;
+    }
+  }
+  message(getwd())
+  
+  saveRDS(object = model.list, 
+          file = out.file,
+          compress = "gzip")
+  return(out.file)
+  
+}
+```
+```{r model evaluation}
+read.model<- function(file){
+        model.list<- readRDS(file)
+        return(
+                sapply(model.list, get.rsq)
+        )
+}
+model.rsqs<- sapply(models, read.model)
+model.rsqs.df<- sapply(1:length(model.rsqs), function(x){
+        row<- rep(NA, 4)
+        x<- model.rsqs[[x]]
+        if(is.null(x)){
+                return(row)
+        }
+        for(i in 1:length(x)){
+                row[i]<-x[i]
+        }
+        return(row)
+}) %>% t %>% data.frame
+colnames(model.rsqs.df)<- sapply(1:4, function(x){
+        return(
+                paste("Attempt",x,sep="_")
+        )
+})
+model.rsqs.df$ORG_1<- model.driver$X1
+model.rsqs.df$ORG_2<- model.driver$X2
+write.table(x=model.rsqs.df, file=sixtyseven.genomes.quadruple.model("rsquared.values.txt"), sep="\t", quote = FALSE, col.names = TRUE)
+success.attempts<- function(x){
+        return(x[!is.na(x)] %>% length)
+}
+model.rsqs.df %>% group_by(ORG_2) %>% do({
+        df<-.
+        return(
+                cbind.data.frame(
+                        Attempt_1.success=success.attempts(df$Attempt_1),
+                        Attempt_2.success=success.attempts(df$Attempt_2),
+                        Attempt_3.success=success.attempts(df$Attempt_3),
+                        Attempt_4.success=success.attempts(df$Attempt_4)
+                )
+        )
+}) ->model.rsqs.df.summary
+
+model.rsqs.df$file<- unlist(models)
+model.rsqs.df.complete<- model.rsqs.df[complete.cases(model.rsqs.df),]
+
+model.rsqs.df.summary %>% melt(id.vars="ORG_1") %>%
+        ggplot(data=., mapping=aes(x=factor(ORG_1), y=value, group=variable, fill=variable)) +
+        geom_bar(stat="identity")
+
+table.model<- function(model){
+        return(
+                table(model$predicted$cluster, 
+                      model$predicted$predicted)
+                )
+}
+
+eval.model<- function(file){
+        model.list<- readRDS(file)
+        return(
+                lapply(model.list, table.model)
+        )
+}
+
+models.eval<- lapply(models, eval.model)
+```
+
+```{r read models}
+bh.data<- bh.data.norm
+factor.core<-c("core","outsider","nosep") #generate three factors to mark states
+if(!"master.table.core.txt" %>% sixtyseven.genomes.quadruple.model %>% file.exists){
+  #generate a matrix big enough to hold the data (essentially the same size as the bh.data), initially filled in with "outsider"
+  master.table.core<-as.data.frame(
+          matrix(
+                  nrow=nrow(bh.data),
+                  ncol=nrow(legend),
+                  factor.core[3]),
+          stringsAsFactors = FALSE)
+  #copy the row names from bh.data
+  row.names(master.table.core)<-row.names(bh.data)
+  #copy colnames fromt he legend
+  colnames(master.table.core)<-legend$id_genomes
+  #now, for each row in the initial bh.table go over the models one by one, load them into ram and see where the row gene is placed 
+  #relative to each genome
+  registerDoMC(cores=6)
+  writeLines(c(""), "log.txt")
+  master.table.core.list<-foreach(i=1:(nrow(legend)-1))%do%{
+    #j must be i+1 because the diagonas are always "nonsep" as you can't really separate the organism with itself
+    foreach(j=(i+1):nrow(legend))%dopar%{
+        sink("log.txt", append=TRUE)
+        #load the corresponding model list
+        model.list.file<- paste(
+                paste(
+                        legend$id_genomes[i],
+                        legend$id_genomes[j],
+                        sep="_"),
+                ".rds",
+                sep = "") %>% sixtyseven.genomes.quadruple.model.models
+        #print(model.list.file)
+        l.m.g<- readRDS(file=model.list.file)
+        #see if all models are present in the list (which indicates that the separation can be done definitively in all attempts with a given rsquared)
+        if(length(l.m.g)==4){
+                #select corresponding genomes
+                data.table<-select.genome.data(bh.data, c(legend$id_genomes[i],legend$id_genomes[j])) %>% filter.genome.data(c(legend$id_genomes[i],legend$id_genomes[j]))
+                #attempt to predict the probabilities for each pair with a precalculated logistic regression
+                data.table$cluster<-grepl(pattern = paste("\\b",legend$id_genomes[i],"X",sep = "",collapse = ""),x = rownames(data.table),perl = TRUE)
+                glm.probs.groups<- sapply(1:length(l.m.g), function(k){
+                        #print(k)
+                        glm.probs<- predict(l.m.g[[k]], data.table, type = "response")
+                        #print(data.table$cluster)
+                        #print(glm.probs)
+                        glm.probs<- sapply(glm.probs,function(l){
+                                if(l>=0.5){
+                                        return(TRUE)
+                                        }else{
+                                                return(FALSE)
+                                                }
+                                })
+                        #print(glm.probs)
+                        return(
+                                ifelse(test = data.table$cluster==glm.probs, yes = factor.core[1], no = factor.core[2])    
+                                )
+                        })
+                
+                sep.factor.v<- apply(glm.probs.groups, 1, function(x){
+                        return(
+                                ifelse(test=all(x==factor.core[2]), yes=factor.core[2], no=factor.core[1])
+                                )
+                        })
+                output.table<- cbind(name=rownames(data.table), cluster=data.table$cluster, match=sep.factor.v==factor.core[1]) %>% data.frame
+                write.table(x=output.table, file=paste(legend$id_genomes[i], legend$id_genomes[j], sep="_") %>% 
+                                    paste0(".txt.match") %>% sixtyseven.genomes.quadruple.model.match(), 
+                            sep="\t", quote = FALSE, row.names = FALSE)
+                #print(sep.factor.v)
+          #assign common name identificators like "X1,2..." in accordance with the legend
+          sep.factor.v.i<-sep.factor.v[grepl(pattern = paste("\\b",legend$id_genomes[i],"X",sep = "",collapse = ""),x = names(sep.factor.v),perl = TRUE)]
+          sep.factor.v.j<-sep.factor.v[grepl(pattern = paste("\\b",legend$id_genomes[j],"X",sep = "",collapse = ""),x = names(sep.factor.v),perl = TRUE)]
+          core.col.j<-which(legend$id_genomes==legend$id_genomes[j])
+          core.col.i<-which(legend$id_genomes==legend$id_genomes[i])
+          #mark i and j cells (because the matrix here is not triangle and needs symmetry)
+          return(list(sep.factor.v.i, sep.factor.v.j, core.col.i, core.col.j))
+        }else{
+                return(list(i, j))
+        }
+    }
+  }
+  for(i in 1:length(master.table.core.list)){
+          for(j in 1:length(master.table.core.list[[i]])){
+                  if(length(master.table.core.list[[i]][[j]])==4){
+                          print(paste("Doing:", i, j, sep=" "))
+                          sep.factor.v.i<- master.table.core.list[[i]][[j]][[1]]
+                          sep.factor.v.j<- master.table.core.list[[i]][[j]][[2]]
+                          core.col.i<- master.table.core.list[[i]][[j]][[3]]
+                          core.col.j<- master.table.core.list[[i]][[j]][[4]]
+                          master.table.core[names(sep.factor.v.i),core.col.j]<-sep.factor.v.i
+                          master.table.core[names(sep.factor.v.j),core.col.i]<-sep.factor.v.j
+                  }
+          }
+  }
+  
+  #finally save out the resulting table
+  write.table(x=master.table.core, file="master.table.core.txt" %>% sixtyseven.genomes.quadruple.model, sep="\t", quote = FALSE)
+}
+```
+
+```{r convert and get output}
+#read the data
+master.table.core<-read.table(file="master.table.core.txt" %>% sixtyseven.genomes.quadruple.model)
+#create a parallel cluster with the cluster log output
+if(logfile %>% file.exists()){
+        file.remove(logfile)
+}
+cluster <<- makeCluster(6,outfile = logfile)
+registerDoParallel(cluster)
+#create a diriving summary of genes
+master.table.core.per.gene.summary<-as.data.frame(
+        t(
+                parApply(cl=cluster, X = master.table.core, MARGIN = 1, FUN = function(i){
+                        sum.core<-length(i[i=="core"])
+                        sum.outsider<-length(i[i=="outsider"])
+                        sum.nosep<-length(i[i=="nosep"])
+                        return(c(core=sum.core, outsider=sum.outsider, nonsep=sum.nosep))
+})))
+#do not forget to close the cluster
+stopCluster(cluster)
+#append the names because the following filter will erase the rownames
+master.table.core.per.gene.summary$gene.name<-row.names(master.table.core.per.gene.summary)
+#separate the "always core table"
+master.table.core.always.core<- master.table.core.per.gene.summary %>% filter(outsider==0)
+head(master.table.core.always.core)
+#separate the "outsider once"
+master.table.core.outsider.once<- master.table.core.per.gene.summary %>% filter(outsider==1)
+head(master.table.core.outsider.once)
+#separate the frequent outsider
+master.table.core.outsider.frequently<- master.table.core.per.gene.summary %>% filter(outsider>1)
+head(master.table.core.outsider.frequently)
+#write out the data
+write.table(master.table.core.always.core, 
+            file="master.table.core.always.core.txt" %>% sixtyseven.genomes.quadruple.model, 
+            sep="\t", col.names=TRUE, quote = FALSE)
+write.table(master.table.core.outsider.once, 
+            file="master.table.core.outsider.once.txt" %>% sixtyseven.genomes.quadruple.model, 
+            sep="\t", col.names=TRUE, quote = FALSE)
+write.table(master.table.core.outsider.frequently, 
+            file="master.table.core.outsider.frequently.txt" %>% sixtyseven.genomes.quadruple.model, 
+            sep="\t", col.names=TRUE, quote = FALSE)
+#
+```
+
+```{r rsquared plot for Drosophila}
+mean.rsqs<- rowMeans(model.rsqs.df[,1:4])
+model.df<- cbind(query.genome=model.rsqs.df$ORG_1, target.genome=model.rsqs.df$ORG_2, rsquared=mean.rsqs)[!is.na(mean.rsqs),] %>% data.frame
+rsq.plot<- model.df %>% filter(query.genome==6|target.genome==6) %>% mutate(target.genome=sapply(1:length(.$target.genome), function(x){
+  if(.$target.genome[x]==6){
+    return(.$query.genome[x])
+  }else{
+    return(.$target.genome[x])
+  }
+})) %>% select(rsquared, target.genome) %>% merge(x=., y=legend, by.x="target.genome", by.y="id_genomes") %>%
+  mutate(name=str_trim(toupper(str_replace_all(string=.$name, pattern = "\\.fasta|_|complete_genome|chromosome", replacement=" ")))) %>% 
+  arrange(rsquared) %>% mutate(name=factor(.$name, levels=.$name)) %>% melt(id.vars="name") %>%
+  filter(variable%in%c("rsquared")) %>% ggplot(data=., mapping=aes(x=name, y=value, group=variable, color=variable))+geom_point()+geom_smooth()+
+  theme_bw()+theme(axis.text.x=element_text(angle = 45, hjust = 1),legend.position="none", plot.margin = unit(c(1, 1, 3, 2), "cm"), axis.title.x=element_text(vjust=1)) + 
+  geom_hline(yintercept = 0.73, color="red") + 
+  xlab("Genome") + ylab("R-squared") + labs(title = "Drosophila simulans models R-squared values")
+plot(rsq.plot)
+pdf(file = "rsq.drosoph.pdf"%>% sixtyseven.genomes.quadruple.model, width = 15, height=8)
+plot(rsq.plot)
+dev.off()
+```
+
+```{r drosophila clusters}
+calculate.clustering.table<- function(bh.data, rsquared.cutoff, rsquared.table, legend, processors=4, data.folder=data.folder){
+        registerDoMC(processors)
+        #for each match table find the genes that are in the core and those, that are outsiders
+        core.outsider.list<-foreach(x=1:nrow(rsquared.table), .errorhandling = "stop", .verbose = FALSE)%dopar%{
+                #extract i and j from the filename
+                ij<- strsplit(x = rsquared.table$match.file.name[x], split = ".", fixed=TRUE)
+                ij<- strsplit(x = ij[[1]][1], split = "_", fixed=TRUE)
+                i<- as.numeric(ij[[1]][1])
+                j<- as.numeric(ij[[1]][2])
+                if(file.exists(data.folder(rsquared.table$match.file.name[x]))){
+                         match.table<- fread(input = data.folder(rsquared.table$match.file.name[x]), sep = "\t", data.table = FALSE, stringsAsFactors = FALSE)
+                }else{
+                         match.table<- select.genome.data(bh.data, c(i,j)) %>% filter.genome.data(c(i,j))
+                         match.table<- match.table %>% mutate(name=rownames(match.table))
+                }
+
+                #split by genome ids
+                i.columns<- match.table %>% filter(grepl(pattern = paste0("\\b",i,"X"),x = name,perl = TRUE))
+                j.columns<- match.table %>% filter(grepl(pattern = paste0("\\b",j,"X"),x = name,perl = TRUE))
+                #if the rsquared is too low, then just return a nonsep-filled columns
+                if(is.na(rsquared.table$rsquared[x])||rsquared.table$rsquared[x]<rsquared.cutoff){
+                        i.col=rep("nosep",nrow(i.columns))
+                        names(i.col)<- i.columns$name
+                        j.col=rep("nosep",nrow(j.columns))
+                        names(j.col)<- j.columns$name
+                        return(list(i.col=i.col, j.col=j.col, i=i, j=j))
+                }else{
+                        i.col=sapply(i.columns$match, function(k){
+                                if(k){
+                                        return("core")
+                                }else{
+                                        return("outsider")
+                                }
+                        })
+                        names(i.col)<- i.columns$name
+                        j.col=sapply(j.columns$match, function(k){
+                                if(k){
+                                        return("core")
+                                }else{
+                                        return("outsider")
+                                }
+                        })
+                        names(j.col)<- j.columns$name
+                        return(list(i.col=i.col, j.col=j.col, i=i, j=j))
+                }
+        }
+        core.outsider.list<-lapply(legend$id_genomes,function(i){
+                sub.list<- lapply(core.outsider.list,function(j){
+                        if(j$i==i){
+                                return(j)
+                        }
+                })
+                return(sub.list[!sapply(sub.list,is.null)])
+        })
+        core.outsider.list<- core.outsider.list[-length(core.outsider.list)]
+        core.outsider.list<- lapply(core.outsider.list, function(x){
+                diagonal.element<- list(i.col = rep("nosep",length(x[[1]]$i.col)),j.col = rep("nosep",length(x[[1]]$i.col)), i=x[[1]]$i, j=x[[1]]$i)
+                names(diagonal.element$i.col)<- names(x[[1]]$i.col)
+                names(diagonal.element$j.col)<- names(x[[1]]$i.col)
+                return(append(x = x,values = list(diagonal.element),0))
+        })
+        last.genome<- select.genomes(df = bh.data, g.ids = legend$id_genomes[nrow(legend)])
+        last.genome.list<-list(list(i.col=rep("nosep", nrow(last.genome)), 
+                                    j.col=rep("nosep",nrow(last.genome)), 
+                                    i=legend$id_genomes[nrow(legend)], 
+                                    j=legend$id_genomes[nrow(legend)]))
+        names(last.genome.list[[1]]$i.col)<- rownames(last.genome)
+        names(last.genome.list[[1]]$j.col)<- rownames(last.genome)
+        core.outsider.list[[length(core.outsider.list)+1]]<- last.genome.list
+        return(core.outsider.list)
+}
+#first prepare the functions
+source("R/extract.cores.R")
+#load the core-outsider data
+model.df<- cbind(query.genome=model.rsqs.df$ORG_1, target.genome=model.rsqs.df$ORG_2, rsquared=mean.rsqs) %>% data.frame
+model.df$match.file.name<- sapply(1:nrow(model.df), function(i){
+        return(
+                paste0(model.df[i,1], '_', model.df[i,2], '.txt.match')
+        )
+})
+model.df[is.na(model.df[,3]),3]<-0
+clustering.list<- calculate.clustering.table(
+  bh.data = bh.data, rsquared.cutoff = 0.73, rsquared.table = model.df, legend = legend, processors = 8,
+  data.folder=sixtyseven.genomes.quadruple.model.match)
+core.distribution.data<- convert.core.list.matrix(clustering.list = clustering.list, legend = legend)
+rsq.bar<- core.distribution.data %>% select.genome.data(6) %>% filter.genome.data(6) %>% mutate(id=rownames(.)) %>% melt(id.vars="id") %>% group_by(variable,value) %>%
+  summarise(times=n()) %>% do({
+    .$times<- rescale(.$times, from = c(0,sum(.$times)),to = c(0,1))
+    return(.)
+  }) %>% ungroup() %>% mutate(variable=str_replace_all(string=.$variable, pattern ="X", replacement="")) %>%
+  merge(x=., y=legend, by.x="variable", by.y="id_genomes") %>% 
+  merge(x=., y=filter(model.df,query.genome==6|target.genome==6) %>% mutate(variable=sapply(1:nrow(.),function(x){
+    if(.$target.genome[x]==6){
+      return(.$query.genome[x])
+    }else{
+      return(.$target.genome[x])
+    }
+  }))) %>% arrange(rsquared) %>% 
+  mutate(name=str_trim(toupper(str_replace_all(string=.$name, pattern = "\\.fasta|_|complete_genome|chromosome", replacement=" ")))) %>%
+  mutate(name=factor(.$name, levels=unique(.$name))) %>%
+  ggplot(data=., mapping=aes(x=name, y=times, group=variable, fill=value, order=value)) +geom_bar(stat="identity") + 
+  theme_bw() + theme(axis.text.x=element_text(angle=45, hjust=1),plot.margin = unit(c(1, 1, 1, 4), "cm")) +
+  xlab("Genome") + ylab("Core/Outsider Ratio") + labs(title="Drosophila Core/Outsider Gene Classification") +
+  geom_segment(mapping=aes(x=1, xend=nrow(legend)-1, y=0.1, yend=0.1), arrow=arrow(length=unit(0.5,"cm")),colour="red") +
+  scale_fill_manual(values=c("#06960B","#999999","#F7728A"),labels=c("Core Genes","No Clear Separation","Outsider Genes"), guide=guide_legend(title=""))
+plot(rsq.bar)
+pdf(file="core.outsider.barplot.pdf" %>% sixtyseven.genomes.quadruple.model, width=15, height=6)
+plot(rsq.bar)
+dev.off()
+```
+
+```{r a more detailed drosophila - wolbachia plot}
+dph.arch.pair<- c(6, 45)
+dph.wb<- bh.data %>% select.genome.data(dph.arch.pair) %>% filter.genome.data(dph.arch.pair)
+dph.wb.clust.one<- (core.distribution.data %>% 
+        select.genome.data(dph.arch.pair, exclude=FALSE) %>% 
+        filter.genome.data(dph.arch.pair[1]))[,2]
+dph.wb.clust.two<- (core.distribution.data %>% 
+        select.genome.data(dph.arch.pair, exclude=FALSE) %>% 
+        filter.genome.data(dph.arch.pair[2]))[,1]
+dph.wb.clust<- c(dph.wb.clust.one, dph.wb.clust.two)
+dph.wb.pca<- prcomp(dph.wb)
+dph.wb.pca.plot.data<- cbind.data.frame(GENE=rownames(dph.wb),
+                                        ORGANISM=sapply(rownames(dph.wb),function(x){
+                                                return(
+                                                        strsplit(x = x, split = "X", fixed = TRUE)[[1]][1]
+                                                )
+                                        }), 
+                                        PC1=dph.wb.pca$x[,1], 
+                                        PC2=dph.wb.pca$x[,2], 
+                                        CLUSTER=dph.wb.clust)
+dph.wb.pca.plot<- dph.wb.pca.plot.data %>% ggplot(data=., mapping=aes(x=PC1, y=PC2)) +
+        geom_point(aes(color=interaction(ORGANISM, CLUSTER))) + theme_bw() +
+        scale_color_manual(values=c("lightpink", "lightblue", "red", "blue"), 
+                           labels=c("A.loki", "D.simulans", "A.loki.OUTSIDER", "D.simulans.OUTSIDER"), 
+                           guide = guide_legend(title="CLUSTER")) + theme(legend.key = element_blank())
+plot(dph.wb.pca.plot)
+pdf(file = "a.loki.vs.d.simulans.pdf"%>% sixtyseven.genomes.quadruple.model, width=10, height=10)
+plot(dph.wb.pca.plot)
+dev.off()
+```
+```{r full core distribution plot}
+#extract the genomes
+bar.plot.core.outsider<- expand.df(short.df = core.distribution.data) %>% select(-QUERY_ORF_ID) %>% 
+  merge(x=., y=legend, by.x="ID_QUERY_GENOME", by.y="id_genomes")%>% select(-ID_QUERY_GENOME) %>%
+  melt(id.vars="name") %>% group_by(name,value) %>% summarize(total=n()) %>% ungroup() %>% group_by(name) %>%
+  do({
+    .$total=rescale(.$total, from=c(0, sum(.$total)), to=c(0,1))
+    return(.)
+  }) %>% ungroup() %>% mutate(name=sapply(name, function(x){
+    if(x=="WOLBACHIA ENDOSYMBIONT OF DROSOPHILA SIMULANS WHA"){
+      return("WOLBACHIA DROSOPHILA")
+    }
+    if(x=="WOLBACHIA ENDOSYMBIONT OF CULEX QUINQUEFASCIATUS PEL"){
+      return("WOLBACHIA CULEX")
+    }
+    return(x)
+  })) %>% 
+  mutate(name=sapply(name,function(x){
+    x<- strsplit(x,split = " ",fixed = TRUE)
+    return(paste(x[[1]][1],x[[1]][2],sep=" "))
+    })) %>% filter(!grepl(name, pattern="ICHTHYOPHTHIRIU", fixed = TRUE))%>%
+  ggplot(data=., mapping=aes(x=value, y=total, group=name, fill=name)) + geom_bar(stat="identity", position="dodge") +
+  theme_bw() + theme(axis.text.x=element_text(angle=45, hjust=1, size=24), legend.position="none", title= element_text(size=32))+
+  facet_wrap(~name,ncol=4) + xlab("") + ylab("proportion") + labs(title="Core/Outsider/NoSep Distribution Over Genomes")
+plot(bar.plot.core.outsider)
+pdf(file="bar.plot.core.outsider.pdf" %>% sixtyseven.genomes.quadruple.model, width=20, height=35)
+plot(bar.plot.core.outsider)
+dev.off()
+```

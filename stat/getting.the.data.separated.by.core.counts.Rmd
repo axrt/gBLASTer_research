@@ -1,0 +1,138 @@
+---
+title: "Getting the data separated by core counts"
+output: 
+  html_document: 
+    fig_caption: yes
+    fig_height: 9
+    fig_width: 12
+    keep_md: yes
+    number_sections: yes
+    toc: yes
+---
+
+First to get the libraries.
+
+```{r load libraries}
+if(!require("gbra")){
+  install.packages("gbra")
+  library("gbra")
+}
+if(!require("reshape2")){
+  install.packages("reshape2")
+  library("reshape2")
+}
+if(!require("scales")){
+  install.packages("scales")
+  library("scales")
+}
+if(!require("doParallel")){
+  install.packages("doParallel")
+  library("doParallel")
+}
+```
+#Loading data
+
+Load the data (in case not there yet)
+
+```{r load initial data}
+bh.data <- read.table(file = "bh.data.minhit_4.txt")
+legend<-load.legend(legend.file = "/home/alext/Developer/gbra/inst/extradata/legend.csv",sep = "\t")
+```
+
+#Data processing
+
+Processing the data to split it into three groups:
+
+* the one that only contains core genes
+* the one that has outsiders just once
+* the rest of the genes, that can be outsiders much more frequently
+
+```{r read models}
+dir<-"data" #data folder
+factor.core<-c("core","outsider","nosep") #generate three factors to mark states
+if(!file.exists("master.table.core.txt")){
+  #generate a matrix big enough to hold the data (essentially the same size as the bh.data), initially filled in with "outsider"
+  master.table.core<-as.data.frame(matrix(nrow=nrow(bh.data),ncol=nrow(legend),factor.core[3]),stringsAsFactors = FALSE)
+  #copy the row names from bh.data
+  row.names(master.table.core)<-row.names(bh.data)
+  #copy colnames fromt he legend
+  colnames(master.table.core)<-legend$id_genomes
+  #now, for each row in the initial bh.table go over the models one by one, load them into ram and see where the row gene is placed 
+  #relative to each genome
+  for(i in 1:(nrow(legend)-1)){
+    #j must be i+1 because the diagonas are always "nonsep" as you can't really separate the organism with itself
+    for(j in (i+1):nrow(legend)){
+      #this if is actually redundant, need to remove
+      if(i!=j){
+        #load the corresponding model
+        load(file = paste(dir,paste(paste(legend$id_genomes[i],legend$id_genomes[j],sep="_"),".rda",sep = ""),sep = "/"))
+        #see if the model R squared score if over 0.75, which makes sence in terms of true positive ratio (needs link)
+        if(as.numeric(l.m.g$Rsq)>=0.75){
+          #for the pair of genomes - restrict the bh.table to only those selected
+          data.table<-select.genomes(df = bh.data, g.ids = c(legend$id_genomes[i],legend$id_genomes[j]))
+          #attempt to predict the probabilities for each pair with a precalculated logistic regression
+          glm.probs<-predict(l.m.g$fit, data.table, type = "response")
+          #actually split into two groups with a 0.5 probability cutoff
+          glm.probs.groups<-sapply(glm.probs,function(i){if(i>=0.5){return(FALSE)}else{return(TRUE)}})
+          #append another column, which can be either true of false to indicate the clusters 
+          data.table$cluster<-grepl(pattern = paste("\\b",legend$id_genomes[i],"X",sep = "",collapse = ""),x = rownames(data.table),perl = TRUE)
+          #see if the clustering assignment matches the true clusters, mark as core if yes, otherwise - outsider
+          sep.factor.v<-ifelse(test = data.table$cluster==glm.probs.groups, yes = factor.core[1], no = factor.core[2])
+          #assign common name identificators like "X1,2..." in accordance with the legend
+          sep.factor.v.i<-sep.factor.v[grepl(pattern = paste("\\b",legend$id_genomes[i],"X",sep = "",collapse = ""),x = names(sep.factor.v),perl = TRUE)]
+          sep.factor.v.j<-sep.factor.v[grepl(pattern = paste("\\b",legend$id_genomes[j],"X",sep = "",collapse = ""),x = names(sep.factor.v),perl = TRUE)]
+          core.col.j<-which(legend$id_genomes==legend$id_genomes[j])
+          core.col.i<-which(legend$id_genomes==legend$id_genomes[i])
+          #mark i and j cells (because the matrix here is not triangle and needs symmetry)
+          for(k in 1:length(sep.factor.v.i)){
+            master.table.core[names(sep.factor.v.i)[k],core.col.j]<-sep.factor.v.i[k]
+          }
+          for(k in 1:length(sep.factor.v.j)){
+            master.table.core[names(sep.factor.v.j)[k],core.col.i]<-sep.factor.v.j[k]
+          }
+        }
+      }
+    }
+  }
+  #finally save out the resulting table
+  write.table(x=master.table.core, file="master.table.core.txt", sep="\t", quote = FALSE)
+}
+```
+
+#Gene states evaluation
+
+For each genomes calculate the totals of states for the genes
+
+```{r convert and get output}
+#read the data
+master.table.core<-read.table(file="master.table.core.txt")
+#create a parallel cluster with the cluster log output
+file.remove("cluster.txt")
+cluster <<- makeCluster(6,outfile = "cluster.txt")
+registerDoParallel(cluster)
+#create a diriving summary of genes
+master.table.core.per.gene.summary<-as.data.frame(t(parApply(cl=cluster, X = master.table.core, MARGIN = 1, FUN = function(i){
+  sum.core<-length(i[i=="core"])
+  sum.outsider<-length(i[i=="outsider"])
+  sum.nosep<-length(i[i=="nosep"])
+  return(c(core=sum.core, outsider=sum.outsider, nonsep=sum.nosep))
+})))
+#append the names because the following filter will erase the rownames
+master.table.core.per.gene.summary$gene.name<-row.names(master.table.core.per.gene.summary)
+#do not forget to cluse the cluster
+stopCluster(cluster)
+#separate the "always core table"
+master.table.core.always.core<- master.table.core.per.gene.summary %>% filter(outsider==0)
+head(master.table.core.always.core)
+#separate the "outsider once"
+master.table.core.outsider.once<- master.table.core.per.gene.summary %>% filter(outsider==1)
+head(master.table.core.outsider.once)
+#separate the frequent outsider
+master.table.core.outsider.frequently<- master.table.core.per.gene.summary %>% filter(outsider>1)
+head(master.table.core.outsider.frequently)
+#write out the data
+write.table(master.table.core.always.core, file="master.table.core.always.core.txt", sep="\t", col.names=TRUE, quote = FALSE)
+write.table(master.table.core.outsider.once, file="master.table.core.outsider.once.txt", sep="\t", col.names=TRUE, quote = FALSE)
+write.table(master.table.core.outsider.frequently, file="master.table.core.outsider.frequently.txt", sep="\t", col.names=TRUE, quote = FALSE)
+#
+```

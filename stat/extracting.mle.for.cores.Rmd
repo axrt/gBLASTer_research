@@ -1,0 +1,257 @@
+---
+title: "Extracting Maximum Likelihood Points For The Cores"
+output: html_document
+---
+
+The point is to use the "core genes" (the ones that are always in the core in accordance with all regression comparisons) to calculate the Maximum Likelihood centers of the cores. The data for this script comes from [here](getting.the.data.separated.by.core.counts.html). Be sure to have the output freshly generated in case you use some ambigous naming in other scripts and could have overriden the files.
+
+```{r load libraries}
+library("gbra") #becaus gbra has the function AND it loads plyr, dplyr, data.table, etc.
+if(!require("ape")){
+  install.packages("ape")
+  library("ape")
+}
+if(!require("stringr")){
+  install.packages("stringr")
+  library("stringr")
+}
+if(!require("Rphylip")){
+  install.packages("Rphylip")
+  library("Rphylip")
+}
+if(!require("doParallel")){
+  install.packages("doParallel")
+  library("doParallel")
+}
+```
+
+```{r quick preparation}
+self.dir<- "extracting.mle.for.cores.output"
+if(!file.exists(self.dir)){
+  dir.create(self.dir)
+}
+self.dir.folder<- function(file=""){
+  return(paste(self.dir, file, sep="/"))
+}
+```
+
+```{r loading data}
+#first of all - legend
+legend<-load.legend(legend.file = "/home/alext/Developer/gbra/inst/extradata/legend.csv",sep = "\t")
+#this table contains all the names in the "gene.name" column
+master.table.core.always.core<-read.table(file="master.table.core.always.core.txt", header = TRUE, sep = "\t")
+#read the data itself
+bh.data.core<-read.table(file="bh.data.minhit_4.txt", header = TRUE, sep="\t")
+#select only core genes from the data
+bh.data.core.only<-bh.data.core[as.character(master.table.core.always.core$gene.name),]
+#attach genome ids to the end (apparently fast enough to run one thread)
+bh.data.core.only$ID_QUERY_GENOME<-sapply(rownames(bh.data.core.only),function(i){
+  return(strsplit(i,"X",fixed = TRUE)[[1]][1])
+})
+#wee need the ID_QUERY_ORF column and ID_QUERY_GENOME columns in front of the dataframe to get the MLEs with a standard function
+bh.data.core.only$ID_QUERY_ORF<-rownames(bh.data.core.only)
+#placind the ID columns in front of the table
+bh.data.core.only <- bh.data.core.only[, c(ncol(bh.data.core.only),(ncol(bh.data.core.only)-1),1:nrow(legend))]
+```
+
+Now it is time to calculate an MLE estimate for each genome.
+
+```{r extracting the MLEs}
+#Calculate MLEs
+genome.mles<-getMLEs(df = bh.data.core.only)
+#get the gprimes
+genome.gprimes<-extract.gprimes(mle.list = genome.mles)
+#format the rownames to have exactly the number of spaces fitch wants to have
+rownames(genome.gprimes)<-sapply(rownames(genome.gprimes), function(i){
+  rn<-str_pad(i, 12, side = "right",pad = " ")
+  return(rn)
+})
+#distance matrix
+genome.mle.dist<-as.matrix(dist(genome.gprimes))
+head(genome.mle.dist)
+#write out as fitch output
+write.fitch(dist.mtx = genome.mle.dist, file=self.dir.folder("core.mle.distance.matrix"))
+write.table(x=genome.mle.dist, file=self.dir.folder("genome.mle.dist.txt"), sep = "\t", quote = FALSE)
+```
+
+```{r plot}
+#assign proper names to the rows
+genome.mle.dist.for.plot<-genome.mle.dist
+rownames(genome.mle.dist.for.plot)<-sapply(rownames(genome.mle.dist),function(i){return(legend$name[which(legend$id_genomes==str_trim(strsplit(i,"X",fixed=TRUE)[[1]][2]))])})
+par(mar=c(0,0,0,20), oma=rep(0,4))
+plot(as.dendrogram(hclust(as.dist(genome.mle.dist.for.plot),method = "ward.D2")), horiz=TRUE)
+par(mar=rep(0,4), oma=rep(0,4))
+plot(as.phylo(hclust(as.dist(genome.mle.dist.for.plot),method = "ward.D2")), type = "fan")
+```
+-----------
+
+So, at this point, it appeared so, that the the hclust is not ideal for the tree generation, and that is why the futher idea is to generate a tree, where the **"outsider"** genomes will participate as **"separate"** organisms.
+
+```{r load the outsiders }
+#load the frequent outsiders
+master.table.core.outsider.frequently<-read.table(file="master.table.core.outsider.frequently.txt", header=TRUE, sep="\t")
+#load the facultative outsiders
+master.table.core.outsider.once<-read.table(file="master.table.core.outsider.once.txt", header=TRUE, sep="\t")
+#outsider table
+master.table.outsiders<-bh.data.core[unique(as.character(master.table.core.outsider.once$gene.name), as.character(master.table.core.outsider.frequently$gene.name)),]
+master.table.outsiders$ID_QUERY_ORF<-rownames(master.table.outsiders)
+master.table.outsiders$ID_QUERY_GENOME<-sapply(rownames(master.table.outsiders), function(i){
+  return(strsplit(i,"X", fixed=TRUE)[[1]][1])
+})
+master.table.outsiders<-master.table.outsiders[,c((ncol(master.table.outsiders)-1),ncol(master.table.outsiders),1:nrow(legend))]
+#calculate mles
+outsider.mles<-getMLEs(df = master.table.outsiders)
+#get the gprimes
+outsider.gprimes<-extract.gprimes(mle.list = outsider.mles)
+head(outsider.gprimes)
+#substitute the "X" for "Y" to distinguish from genomes
+rownames(outsider.gprimes)<-sapply(rownames(outsider.gprimes),function(i){
+  return(paste0("Y",strsplit(i,"X",fixed=TRUE)[[1]][2]))
+})
+rownames(outsider.gprimes)<-sapply(rownames(outsider.gprimes), function(i){
+  rn<-str_pad(i, 12, side = "right",pad = " ")
+  return(rn)
+})
+colnames(outsider.gprimes)<-rownames(outsider.gprimes)
+#combine with with genomes
+total.mles<-rbind(genome.gprimes,outsider.gprimes)
+#distance
+total.dist<-as.matrix(dist(total.mles))
+#write out as fitch output
+write.fitch(dist.mtx = total.dist, file=self.dir.folder("total.dist.txt"))
+```
+
+Now, we decided to try the cutoff 3 for an outsider to be considered "outsider".
+
+```{r cutoff 3 on outsider}
+#select those that appear as outsiders 3 and more times
+master.table.outsiders.3.cutoff <- master.table.core.outsider.frequently %>% filter(outsider>=3)
+#select the corresponding data
+bh.data.3.cutoff<- bh.data.core[as.character(master.table.outsiders.3.cutoff$gene.name),]
+head(bh.data.3.cutoff)
+#same stuff - attach the id-columns and sort so that the id-columns appear in the beginning
+bh.data.3.cutoff$ID_QUERY_ORF<-rownames(bh.data.3.cutoff)
+bh.data.3.cutoff$ID_QUERY_GENOME<-sapply(rownames(bh.data.3.cutoff), function(i){
+  return(strsplit(i,"X", fixed=TRUE)[[1]][1])
+})
+bh.data.3.cutoff <- bh.data.3.cutoff[,c((ncol(bh.data.3.cutoff)-1),ncol(bh.data.3.cutoff),1:nrow(legend))]
+head(bh.data.3.cutoff)
+#get mles
+outsider.3.cutoff<- getMLEs(df = bh.data.3.cutoff)
+#extract mle gprimes
+outsider.3.cutoff.gprimes<- extract.gprimes(outsider.3.cutoff)
+#rename the outsider gprimes to mark them out among the core clusters
+rownames(outsider.3.cutoff.gprimes)<-sapply(rownames(outsider.3.cutoff.gprimes),function(i){
+  return(paste0("Y",strsplit(i,"X",fixed=TRUE)[[1]][2]))
+})
+#finally assemble a full table
+core.plus.outsider.3.cutoff<-rbind(genome.gprimes, outsider.3.cutoff.gprimes)
+head(core.plus.outsider.3.cutoff)
+#calculate distance
+core.plus.outsider.3.cutoff.dist<- as.matrix(dist(core.plus.outsider.3.cutoff))
+#save for fitch
+write.fitch(dist.mtx = core.plus.outsider.3.cutoff.dist, file = self.dir.folder("core.plus.outsider.3.cutoff.dist.txt"))
+#try out Rfitch here
+core.plus.outsider.3.cutoff.fitch<- Rfitch(D = core.plus.outsider.3.cutoff.dist, path = "/usr/local/bin", model="ME", power=2, negative=TRUE,global=FALSE,random.order=FALSE, root=FALSE)
+write.tree(phy = core.plus.outsider.3.cutoff.fitch, file = self.dir.folder("core.plus.outsider.3.cutoff.fitch.newick"))
+```
+
+At this point we decided to create 43 (the number of 3+ outsiders) trees to see what happens if we substitute a core for its outsiders.
+But firs we need a function to rename the "X,Y" stuff back onto names.
+
+```{r renaming function}
+rename.tree<-function(tree, legend){
+  if(!require("tidyr")){
+    install.packages("tidyr")
+    library("tidyr")
+  }
+  tree$tip.label<-sapply(tree$tip.label,function(i){
+    if(grepl(x=i, pattern = "X",fixed = TRUE)){
+      return(paste0(legend$name[which(legend$id_genomes==extract_numeric(i))],"_genome"))
+    }else{
+      return(paste0(legend$name[which(legend$id_genomes==extract_numeric(i))],"_OUTSIDER>>>>>>"))
+    }
+  })
+  return(tree)
+}
+```
+
+Lets try renaming..
+
+```{r renaming}
+#now do fitch
+rf<- Rfitch(D=total.dist, path = "/usr/local/bin", model="ME", power=2, negative=TRUE, global=FALSE,random.order=FALSE, root=FALSE, quiet=TRUE)
+write.tree(phy = rf, file = self.dir.folder("total.dist.newick"))
+write.tree(phy = rename.tree(tree = rf,legend = legend), file = self.dir.folder("total.dist.names.newick"))
+rf<- Rfitch(D=genome.mle.dist, path = "/usr/local/bin", model="ME", power=2, negative=TRUE, global=FALSE,random.order=FALSE, root=FALSE, quiet=TRUE)
+write.tree(phy = rf, file = self.dir.folder("cores.only.dist.newick"))
+write.tree(phy = rename.tree(tree = rf,legend = legend), file = self.dir.folder("cores.only.dist.names.newick"))
+#and the big one
+core.plus.outsider.3.cutoff.fitch.names<-rename.tree(tree = core.plus.outsider.3.cutoff.fitch,legend = legend)
+write.tree(phy = core.plus.outsider.3.cutoff.fitch.names, file = self.dir.folder("cores.only.3.cut.dist.names.newick"))
+plot(core.plus.outsider.3.cutoff.fitch.names, type="fan")
+```
+
+Ok, works, so now to the substitutions..
+
+```{r substitutions for outsiders}
+#I have used the cluster previouslu, so in case we want any output to be readable (which anyways it won't be cuz there is not sync on threads),
+#we need to delete the log file first
+if(!file.exists("cluster.txt")){
+  file.remove("cluster.txt")
+}
+#create a dedicated directory
+subdir<-"distance"
+if(!file.exists(subdir)){
+  dir.create(subdir)
+}
+cluster <- makeCluster(6,outfile = "cluster.txt")
+registerDoParallel(cluster)
+clusterExport(cl=cluster, varlist = c("outsider.3.cutoff.gprimes","genome.gprimes","subdir","self.dir.folder","self.dir"))
+#the cluster is gonna need a bunch of librarires
+clusterEvalQ(cl = cluster,library("Rphylip"))
+clusterEvalQ(cl = cluster,library("tidyr"))
+clusterEvalQ(cl = cluster,library("ape"))
+#be cauthious here, because fitch saves the output to a one single file, called "output" and some other files, 
+#thereby we need to create a folder and setwd() into that directory prior to running fitch
+fitches<-parLapply(cl = cluster,rownames(outsider.3.cutoff.gprimes),function(i){
+  #extract the genome id
+  gen.num<-as.character(extract_numeric(i))
+  #make a separate directory
+  dir.create(gen.num)
+  #get current directory 
+  c.dir<-getwd()
+  #cd into the dir
+  setwd(gen.num)
+  #get all genomes except for the one that is being substitutes by it's outsider counterpart
+  g.gp<- genome.gprimes[!grepl(x=rownames(genome.gprimes),pattern = paste0("[X]",gen.num,"(\\b|\\s)"),perl=TRUE),]
+  #get the counterpart itself
+  substitute.gprime<- outsider.3.cutoff.gprimes[grepl(x=rownames(outsider.3.cutoff.gprimes),pattern = paste0("[Y]",gen.num,"(\\b|\\s)"),perl=TRUE),]
+  #combine
+  substituted<-rbind(substitute.gprime,g.gp)
+  rownames(substituted)[1]<-paste0("Y",gen.num)
+  #calculate the distance
+  substituted.distance<-dist(substituted)
+  fi<- Rfitch(D=substituted.distance,path = "/usr/local/bin", model="ME", power=2, negative=TRUE, global=FALSE,random.order=FALSE, root=FALSE, quiet=TRUE)
+  setwd(c.dir)
+  unlink(gen.num,recursive = TRUE)
+  #plus save the matrix just in case..
+  write.table(x=as.matrix(substituted.distance), file=paste(getwd(), subdir, paste0(gen.num,".dmt"), sep="/"), sep="\t", quote = FALSE)
+  fi$id<-gen.num
+  return(fi)
+})
+#now for each plot - renames nodes and save as newick
+clusterExport(cl=cluster,c("fitches","legend","rename.tree"))
+fitches<-parLapply(cl=cluster,X = fitches, fun = function(i){
+  return(rename.tree(tree = i, legend = legend))
+})
+#save newick
+clusterExport(cl=cluster,c("fitches"))
+fitches<-parLapply(cl=cluster,X = fitches, fun = function(i){
+  write.tree(phy = i, file = self.dir.folder(paste0(i$id,".substitute.tree.newick")))
+  return(i)
+})
+#do not forget to cluse the cluster
+stopCluster(cluster)
+```
+

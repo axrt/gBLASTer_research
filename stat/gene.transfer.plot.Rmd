@@ -1,0 +1,112 @@
+---
+title: "Gene Transfer"
+output: html_document
+---
+
+First thing is the libraries:
+```{r}
+if(!require("circlize")){
+  install.packages("circlize")
+  library("circlize")
+}
+if(!require("doParallel")){
+  install.packages("doParallel")
+  library("doParallel")
+}
+if(!require("gbra")){
+  install.packages("gbra")
+  library("gbra")
+}
+if(!require("foreach")){
+  install.packages("foreach")
+  library("foreach")
+}
+if(!require("data.table")){
+  install.packages("data.table")
+  library("data.table")
+}
+```
+
+Select genome names as factors:
+```{r}
+#load the data
+master.table.core<-read.table(file="master.table.core.txt")
+#load legend
+legend<-load.legend(legend.file = "/home/alext/Developer/gbra/inst/extradata/legend.csv",sep = "\t")
+head(master.table.core[,1:7])
+#register cluster for parallel with log in "cluster.txt"
+cluster <- makeCluster(6,outfile = "cluster.txt")
+#export the table
+clusterExport(cluster,"master.table.core")
+#extract genomes in parallel
+master.table.core$genome<-parSapply(cl = cluster, 
+                                    X = rownames(master.table.core), 
+                                    FUN = function(i){
+                                      return(strsplit(x = i, split = "X")[[1]][1])
+                                    } )
+#add colors to legend
+legend$colors<-rainbow(n = nrow(legend), alpha = 0.1)
+#join the tables
+master.table.core<-merge(x = master.table.core, y = legend, by.y = "id_genomes", by.x = "genome")
+#factor the genome ids
+master.table.core$genome<-factor(master.table.core$genome, levels=legend$id_genomes)
+#number each row
+master.table.core<-master.table.core %>% group_by(genome) %>% do({
+  return(cbind(.,number=(1:nrow(.))))
+})
+volumes<-master.table.core %>% group_by(genome) %>% summarize(vol=n())
+#quick check
+head(master.table.core)[,c(1:3,ncol(master.table.core))]
+#do not forget to stop cluster in any case
+stopCluster(cluster)
+```
+
+Now create a plot frame:
+
+```{r}
+cluster <- makeCluster(6,outfile = "cluster.txt")
+#export the table
+clusterExport(cluster,c("master.table.core", "legend"))
+
+
+links<-parApply(cl=cluster, X=master.table.core, MARGIN = 1, function(i){
+  i.row<-i[2:(nrow(legend)+1)]
+  i.row<-i.row[i.row=="outsider"]
+  if(length(i.row)==0){
+    return(data.frame())
+  }
+  return(as.data.frame(cbind(shot=i[1],target=sapply(names(i.row), function(x){
+    target.genome<-strsplit(x,"X")[[1]][2]
+    return(target.genome)
+  }), colour=i[(length(i)-1)], number=i[length(i)])))
+})
+
+stopCluster(cluster)
+links<-as.data.frame(rbindlist(links))
+links$target<-factor(links$target, levels=levels(links$shot))
+links$number<-as.numeric(as.character(links$number))
+links$colour<-as.character(links$colour)
+
+par(mar = c(1, 1, 1, 1), lwd = 0.1, cex = 0.7) #Ensures that the plot is actually a circle
+circos.par("track.height" = 0.1)
+circos.initialize(factors = links$shot, x=links$number, xlim = c(0, 1))
+circos.trackPlotRegion(factors = links$shot, ylim = c(0, 1), bg.col = "steelblue",
+    bg.border = "blue", track.height = 0.05)
+
+
+links <-links %>% group_by(shot) %>% do({
+  m<-max(.[,4])
+  for(i in 1:nrow(.)){
+    circos.link(sector.index1 = .$shot[i], point1 = .$number[i]/m, sector.index2=.$target[i], point2=0.5, col=.$colour[i])
+  }
+  return(.)
+})
+
+circos.text(x = rep(0.5,nrow(legend)), y=rep(0,nrow(legend)), labels = legend$name, facing = "clockwise", adj=c(0,05))
+
+circos.clear()
+
+```
+```{r}
+
+```

@@ -1,0 +1,278 @@
+---
+title: "Rebuild a Tree With Another Set Of Genomes"
+author: "Alexander Tuzhikov"
+date: "December 3, 2015"
+output: html_document
+---
+
+```{r quick prep}
+source("R/helper.R")
+source("R/yr.lib.R")
+source("R/scales.lib.R")
+source("R/total.logit.model.R")
+source("R/doparallel.lib.R")
+source("R/devtools.lib.R")
+source("R/ggplot2.lib.R")
+source("R/pander.lib.R")
+source("R/domc.lib.R")
+source("R/hmptreesextend.lib.R")
+source("R/convert.core.list.matrix.R")
+source("R/calculate.clustering.table.R")
+source("R/extract.cores.R")
+source("R/rphylip.lib.R")
+source("R/httr.lib.R")
+if(!require("gbra")){
+  install_github("axrt/gbra")
+  library(gbra)
+}
+sixtyseven.genomes<-"67.genomes"
+model.df.file<- "model.df.txt"
+bh.data.raw.file<- "bh.data.raw.rda"
+bh.data.normal.file<- "bh.data.normal.rda"
+processors<- 6
+if(!file.exists(sixtyseven.genomes)){
+  dir.create(sixtyseven.genomes)
+}
+```
+
+Once again, first we update the legend file
+```{r load legend}
+if(!file.exists(sixtyseven.genomes.dir("legend.txt"))){
+  connection<- connect.derby(db = "/home/alext/Documents/Research/gBLASTer/db/gblasterdb", usr = "APP",
+                             derby.jar = "/home/alext/Developer/gBLASTer/out/artifacts/gBLASTer_jar/derby-10.9.1.0.jar")
+  #save the newly created legend
+  legend<- save.legend(conn = connection$conn, out.file = "master/legend.txt") #both saves the legend and loads one
+  #drop connection
+  dbDisconnect(connection$conn)
+  #save the legend
+  write.table(x=legend, file=sixtyseven.genomes.dir("legend.txt"), quote = FALSE, sep = "\t", row.names = FALSE, col.names = c("id_genomes", "name"))
+}
+legend<- read.table(file=sixtyseven.genomes.dir("legend.txt"), sep="\t", header=TRUE, stringsAsFactors = FALSE) %>% 
+  filter(id_genomes!=23) %>% 
+  filter(id_genomes!=40) %>% 
+  filter(id_genomes!=47) %>%
+  filter(id_genomes!=57) %>%
+  filter(id_genomes!=63) %>%
+  filter(id_genomes!=64) %>%
+  select(name, id_genomes) %>%
+  arrange(id_genomes)
+```
+
+Now we can load in the bh files in accordance with the legend
+
+```{r load bh files}
+if(!file.exists(sixtyseven.genomes.dir(bh.data.raw.file))){
+  bh.data<- read.bhs(bh.folder = data.bh())
+  #write out table as r object
+  if(!file.exists(sixtyseven.genomes.dir(bh.data.raw.file))){
+    save(bh.data, file = sixtyseven.genomes.dir(bh.data.raw.file))
+  }
+}else{
+  load(sixtyseven.genomes.dir(bh.data.raw.file))
+}
+```
+
+Time to normalize the data
+
+```{r normalize the data}
+if(!file.exists(sixtyseven.genomes.dir(bh.data.normal.file))){
+  bh.data%>% 
+    as.data.frame() %>%
+    restrict.minimal.hits(minhit = 4) %>%
+    normalize.scores() %>%
+    attach.genomeid.header() %>%
+    sign.bh.table() -> bh.data.norm
+  #save
+  save(bh.data.norm, file = sixtyseven.genomes.dir(bh.data.normal.file))
+}else{
+  load(sixtyseven.genomes.dir(bh.data.normal.file))
+}
+```
+
+Let us first try to fit the models and use no step simplification
+
+```{r fit models}
+predict.fun<- function(){
+  cur.dir<- getwd()
+  setwd(sixtyseven.genomes.dir())
+  glm.summaries<- total.logit.model(df = bh.data.norm, legend = legend, cores = 6, direction="backward")
+  setwd(cur.dir)
+  return(glm.summaries)
+}
+glm.summaries<- predict.fun()
+```
+
+Now let us see for the statistics over the models.
+
+```{r model statistics, cache=TRUE}
+#collect model names
+model.names<- unlist(lapply(1:nrow(legend),function(i){
+  return(lapply(i:nrow(legend),function(j){
+    if(i!=j){
+          return(paste0(paste(legend$id_genomes[i],legend$id_genomes[j],sep="_"),".rda"))
+    }
+  }))
+}))
+#read model one by one and collect the r-squared values
+if(!file.exists(sixtyseven.genomes.dir(model.df.file))){
+  cluster<- makeCluster(processors)
+  registerDoParallel(cl=cluster, cores = processors)
+  clusterExport(cluster, c("model.names","sixtyseven.genomes.dir","sixtyseven.genomes.data.dir"))
+  model.rsquared<- parSapply(cl = cluster, model.names, function(x){
+    load(sixtyseven.genomes.data.dir(x))
+    return(l.m.g$Rsq)
+  })
+  stopCluster(cluster)
+  #now get put the table together
+  model.df<- data.frame(file.name=model.names, rsquared=model.rsquared, stringsAsFactors = FALSE)
+  model.df.genomes<- strsplit(x = str_replace_all(string = model.df$file.name, pattern = "\\.rda", replacement = ""), split = "_", fixed = TRUE)
+  model.df$query.genome<- as.numeric(unlist(sapply(model.df.genomes,function(x){return(x[[1]])})))
+  model.df$target.genome<- as.numeric(unlist(sapply(model.df.genomes,function(x){return(x[[2]])})))
+  model.df$match.file.name<- str_replace_all(string = model.df$file.name, pattern = "rda", replacement = "txt.match")
+  #save the table
+  write.table(x=model.df, file=sixtyseven.genomes.dir(model.df.file), quote = FALSE, sep="\t")
+}
+model.df<-read.table(file = sixtyseven.genomes.dir(model.df.file), sep="\t", stringsAsFactors = FALSE, header = TRUE)
+#plot the distribution of rsquareds
+model.df %>% arrange(rsquared) %>% ggplot(data=., mapping=aes(x=rescale_max(as.numeric(factor(file.name, levels=file.name))), y= rsquared)) + 
+  geom_line(color="red") + xlab("Model number (scaled)") + ylab("R squared") + theme_bw()
+```
+
+```{r checking sanity for the models}
+#checking sanity
+gen.pca(df = select.genomes(g.ids = c(3,6), df = bh.data.norm), legend = legend, g.ids = c(3, 6))
+```
+Now let's predict the models.
+
+```{r predict models}
+if(!file.exists(sixtyseven.genomes.pred.dir())){
+  dir.create(sixtyseven.genomes.pred.dir())
+}
+#read models
+registerDoMC(processors)
+model.predictions<- foreach(x=model.names, .combine = "c", .packages = c("gbra"))%dopar%{
+  prediction.file<- sixtyseven.genomes.pred.dir(str_replace_all(string = x, pattern = "rda", replacement = "txt"))
+  #if the output does not exist
+  if(!file.exists(prediction.file)){
+    load(sixtyseven.genomes.data.dir(x))
+    #get the model id pair (still separated by "_" for the time)
+    ij<- strsplit(x = x[1],split = ".",fixed = TRUE)[[1]][1]
+    #now split into individual ids
+    ij<-as.numeric(unlist(strsplit(x = ij, split="_", fixed=TRUE)))
+    #and assign to variables for convinience
+    i<-ij[1]
+    j<-ij[2]
+    #for the pair of genomes - restrict the bh.table to only those selected (select genomes that correspond to the ids in other words)
+    data.tab<-select.genomes(df = bh.data.norm, g.ids = c(i,j))
+    #attempt to predict the probabilities for each pair with a precalculated logistic regression
+    glm.probs<-predict(l.m.g$fit, data.tab, type = "response")
+    names(glm.probs)<- rownames(data.tab)
+    #combine the predicitons into one dataframe to write out
+    glm.probs<-cbind(name=names(glm.probs), probs=glm.probs) %>% data.frame(stringsAsFactors = FALSE)
+    #write out actually
+    write.table(x = glm.probs, file=prediction.file, quote=FALSE, sep="\t")
+  }
+  return(prediction.file)
+}
+```
+
+```{r evaluate predictions}
+#read models
+registerDoMC(processors)
+model.match<- foreach(x=model.predictions, .combine = "c", .packages = c("gbra"))%dopar%{
+  match.file<-paste0(x,".match")
+  #see if the file exists already
+  if(!file.exists(match.file)){
+    #load the predicitons table
+    prediction.data<- fread(input = x, sep = "\t", data.table = FALSE, stringsAsFactors = FALSE)[,2:3]
+    #make sure the colnames are there (not nessessary actually, probably should remove)
+    colnames(prediction.data)<- c("name","probs")
+    #get the model id pair (still separated by "_" for the time)
+    ij<- strsplit(x = str_replace_all(string = x,pattern = sixtyseven.genomes.pred.dir(),replacement = ""),split = ".",fixed = TRUE)[[1]][1]
+    #now split into individual ids
+    ij<-as.numeric(unlist(strsplit(x = ij, split="_", fixed=TRUE)))
+    #and assign to variables for convinience
+    i<-ij[1]
+    j<-ij[2]
+    #assign clusters in accordance with the ids, FALSE is likely to go first
+    prediction.data$cluster<- grepl(pattern = paste("\\b",i,"X",sep = "",collapse = ""), x = prediction.data$name, perl = TRUE)
+    #for each gene see if the probability favors it to stay in its own cluster, or sends it to the other one
+    prediction.data$prediction<- sapply(prediction.data$probs,function(t){
+      return(t<0.5)
+    })
+    #now see if the predictions match the actual clustering
+    prediction.data$match<- sapply(1:nrow(prediction.data),function(k){
+      return(prediction.data$cluster[k]==prediction.data$prediction[k])
+    })
+    #finally write out the updated table file, with match column in it this time
+    write.table(x = prediction.data, file=match.file, quote=FALSE, sep="\t", row.names = FALSE)
+  }
+  #return the filename for the future reuse
+  return(match.file)
+}
+```
+
+```{r drosophila clusters}
+#load the core-outsider data
+core.distribution.data<- convert.core.list.matrix(clustering.list = calculate.clustering.table(
+  bh.data = bh.data.norm, rsquared.cutoff = 0.73, rsquared.table = model.df, legend = legend, processors = processors, data.folder = sixtyseven.genomes.pred.dir), legend = legend)
+
+save(core.distribution.data, file = sixtyseven.genomes.dir("core.distribution.data.rda"))
+
+rsq.bar<- core.distribution.data %>% select.genomes(df=., g.ids=6) %>% mutate(id=rownames(.)) %>% melt(id.vars="id") %>% group_by(variable,value) %>%
+  summarise(times=n()) %>% do({
+    .$times<- rescale(.$times, from = c(0,sum(.$times)),to = c(0,1))
+    return(.)
+  }) %>% ungroup() %>% mutate(variable=str_replace_all(string=.$variable, pattern ="X", replacement="")) %>%
+  merge(x=., y=legend, by.x="variable", by.y="id_genomes") %>% 
+  merge(x=., y=filter(model.df,query.genome==6|target.genome==6) %>% mutate(variable=sapply(1:nrow(.),function(x){
+    if(.$target.genome[x]==6){
+      return(.$query.genome[x])
+    }else{
+      return(.$target.genome[x])
+    }
+  }))) %>% arrange(rsquared) %>% 
+  mutate(name=str_trim(toupper(str_replace_all(string=.$name, pattern = "\\.fasta|_|complete_genome|chromosome", replacement=" ")))) %>%
+  mutate(name=factor(.$name, levels=unique(.$name))) %>%
+  ggplot(data=., mapping=aes(x=name, y=times, group=variable, fill=value, order=value)) +geom_bar(stat="identity") + 
+  theme_bw() + theme(axis.text.x=element_text(angle=45, hjust=1),plot.margin = unit(c(1, 1, 1, 4), "cm")) +
+  xlab("Genome") + ylab("Core/Outsider Ratio") + labs(title="Drosophila Core/Outsider Gene Classification") +
+  geom_segment(mapping=aes(x=1, xend=nrow(legend)-1, y=0.1, yend=0.1), arrow=arrow(length=unit(0.5,"cm")),colour="red") +
+  scale_fill_manual(values=c("#06960B","#999999","#F7728A"),labels=c("Core Genes","No Clear Separation","Outsider Genes"), guide=guide_legend(title=""))
+plot(rsq.bar)
+pdf(file=sixtyseven.genomes.dir("core.outsider.barplot.pdf"),width=15, height=6)
+plot(rsq.bar)
+dev.off()
+```
+
+```{r logistic regression cleaned tree}
+#select only core genes
+bh.data.cores<- bh.data.norm[extract.cores(bh.data = bh.data.norm, core.number.cutoff=5, core.outsider.df = core.distribution.data, processors = 6),]
+#extract mle gprimes
+bh.data.cores.mles.gprimes<- extract.gprimes(mle.list = getMLEs(df = expand.df(bh.data.cores)))
+#distance
+bh.data.cores.mles.gprimes.dist<- dist(bh.data.cores.mles.gprimes)
+#fitch
+rf<- Rfitch(D=bh.data.cores.mles.gprimes.dist,path = "/usr/local/bin", model="FM", power=2, negative=TRUE, global=FALSE,random.order=FALSE, root=FALSE, quiet=TRUE)
+#normalize the genome names
+rf.names<- tidy.tree(tree = rf, legend = legend)
+output.file<- sixtyseven.genomes.dir("clean.tree.0.73.rsq.5.corecut.newick")
+write.tree(phy = rf.names, file = output.file)
+plot.itol(newick.file = output.file, output.file = paste0(output.file,".pdf"))
+plot.itol(newick.file = output.file, output.file = paste0(output.file,".eps"), format = "eps", font.size = 120)
+
+ward.tree.hclust<- hclust(bh.data.cores.mles.gprimes.dist, method = "ward.D2")
+ward.tree.hclust.ren<- tidy.tree(tree = as.phylo(ward.tree.hclust), legend = legend)
+pdf(file = sixtyseven.genomes.dir("ward.tree.hclust.ren.pdf"), width = 25, height = 25)
+par(mar=c(rep(12,4)))
+plot(as.dendrogram(as.hclust(ward.tree.hclust.ren)),type = "triangle", horiz = TRUE)
+dev.off()
+
+avg.tree.hclust<- hclust(bh.data.cores.mles.gprimes.dist, method = "average")
+avg.tree.hclust.ren<- tidy.tree(tree = as.phylo(avg.tree.hclust), legend = legend)
+pdf(file = sixtyseven.genomes.dir("avg.tree.hclust.ren.pdf"), width = 25, height = 25)
+par(mar=c(rep(12,4)))
+plot(as.dendrogram(as.hclust(avg.tree.hclust.ren)), horiz = TRUE)
+dev.off()
+
+```

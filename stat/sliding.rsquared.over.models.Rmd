@@ -1,0 +1,450 @@
+---
+title: "Sliding Rsquared Over Models"
+output: 
+  html_document: 
+    fig_caption: yes
+    fig_height: 9
+    fig_width: 12
+    keep_md: yes
+    number_sections: yes
+    toc: yes
+---
+
+Lets' see how many logistic models do we have:
+
+```{r libraries}
+if(!require("doParallel")){
+  install.packages("doParallel")
+  library("doParallel")
+}
+if(!require("ggplot2")){
+  install.packages("ggplot2")
+  library("ggplot2")
+}
+if(!require("scales")){
+  install.packages("scales")
+  library("scales")
+}
+if(!require("stringr")){
+  install.packages("stringr")
+  library("stringr")
+}
+if(!require("doMC")){
+  install.packages("doMC")
+  library("doMC")
+}
+if(!require("foreach")){
+  install.packages("foreach")
+  library("foreach")
+}
+if(!require("data.table")){
+  install.packages("data.table")
+  library("data.table")
+}
+source("R/rphylip.lib.R")
+source("R/httr.lib.R")
+library("gbra")
+```
+
+```{r quick prep}
+#load the helper
+source("helper.R")
+source("R/helper.R")
+#assign self a directory
+self.dir<- "sliding.rsquared.over.models.output"
+if(!file.exists(self.dir)){
+  dir.create(self.dir)
+}
+self.dir.folder<- function(file=""){
+  return(paste(self.dir, file, sep="/"))
+}
+```
+
+```{r loading legend and data}
+bh.data <- read.table(file = "bh.data.minhit_4.txt") #data
+legend<-load.legend(legend.file = "/home/alext/Developer/gbra/inst/extradata/legend.csv",sep = "\t") #legend
+```
+
+##Reading models
+
+First let's read all models and see which Rsquareds do they have
+
+```{r read models}
+dir<-"data" #data folder
+#read all models and write the rsuqareds in one table
+model.names<- unlist(lapply(1:nrow(legend),function(i){
+  return(lapply(i:nrow(legend),function(j){
+    if(i!=j){
+          return(paste0(paste(legend$id_genomes[i],legend$id_genomes[j],sep="_"),".rda"))
+    }
+  }))
+}))
+model.df.file<- "model.df.txt"
+if(!file.exists(model.df.file)){
+  cluster<- makeCluster(4)
+  registerDoParallel(cl=cluster, cores = 4)
+  clusterExport(cluster, c("model.names","dir"))
+  model.rsquared<- parSapply(cl = cluster, model.names, function(x){
+    load(data.folder(x))
+    return(l.m.g$Rsq)
+  })
+  stopCluster(cluster)
+  #now get put the table together
+  model.df<- data.frame(file.name=model.names, rsquared=model.rsquared, stringsAsFactors = FALSE)
+  #save the table
+  write.table(x=model.df, file=model.df.file, quote = FALSE, sep="\t")
+}
+model.df<-read.table(file = model.df.file, sep="\t", stringsAsFactors = FALSE, header = TRUE)
+```
+
+Let's do a quick overview of the Rsquared distribution.
+
+```{r plot rsquared}
+#plot the distribution of rsquareds
+model.df %>% arrange(rsquared) %>% ggplot(data=., mapping=aes(x=rescale_max(as.numeric(factor(file.name, levels=file.name))), y= rsquared)) + 
+  geom_line(color="red") + xlab("Model number (scaled)") + ylab("R squared") + theme_bw()
+```
+
+##Predicting models
+
+Now, the idea is to read all models, predict the selection of two genomes and save the predicted clusters.
+
+```{r predict models}
+#read models
+registerDoMC(4)
+model.predictions<- foreach(x=model.names, .combine = "c", .packages = c("gbra"))%dopar%{
+  prediction.file<-data.folder(str_replace_all(string = x, pattern = "rda", replacement = "txt"))
+  #if the output does not exist
+  if(!file.exists(prediction.file)){
+    load(data.folder(x))
+    #get the model id pair (still separated by "_" for the time)
+    ij<- strsplit(x = x[1],split = ".",fixed = TRUE)[[1]][1]
+    #now split into individual ids
+    ij<-as.numeric(unlist(strsplit(x = ij, split="_", fixed=TRUE)))
+    #and assign to variables for convinience
+    i<-ij[1]
+    j<-ij[2]
+    #for the pair of genomes - restrict the bh.table to only those selected (select genomes that correspond to the ids in other words)
+    data.tab<-select.genomes(df = bh.data, g.ids = c(i,j))
+    #attempt to predict the probabilities for each pair with a precalculated logistic regression
+    glm.probs<-predict(l.m.g$fit, data.tab, type = "response")
+    names(glm.probs)<- rownames(data.tab)
+    #combine the predicitons into one dataframe to write out
+    glm.probs<-cbind(name=names(glm.probs), probs=glm.probs) %>% data.frame(stringsAsFactors = FALSE)
+    #write out actually
+    write.table(x = glm.probs, file=prediction.file, quote=FALSE, sep="\t")
+  }
+  return(prediction.file)
+}
+```
+
+Now, go over all prediction tables, see which genes match the true clusters, and which do not, save as `.match` files (tables).
+
+```{r evaluate predictions}
+#read models
+registerDoMC(4)
+model.match<- foreach(x=model.predictions, .combine = "c", .packages = c("gbra"))%dopar%{
+  match.file<-paste0(x,".match")
+  #see if the file exists already
+  if(!file.exists(match.file)){
+    #load the predicitons table
+    prediction.data<- fread(input = x, sep = "\t", data.table = FALSE, stringsAsFactors = FALSE)[,2:3]
+    #make sure the colnames are there (not nessessary actually, probably should remove)
+    colnames(prediction.data)<- c("name","probs")
+    #get the model id pair (still separated by "_" for the time)
+    ij<- strsplit(x = str_replace_all(string = x,pattern = paste0(dir,"/"),replacement = ""),split = ".",fixed = TRUE)[[1]][1]
+    #now split into individual ids
+    ij<-as.numeric(unlist(strsplit(x = ij, split="_", fixed=TRUE)))
+    #and assign to variables for convinience
+    i<-ij[1]
+    j<-ij[2]
+    #assign clusters in accordance with the ids, FALSE is likely to go first
+    prediction.data$cluster<- grepl(pattern = paste("\\b",i,"X",sep = "",collapse = ""), x = prediction.data$name, perl = TRUE)
+    #for each gene see if the probability favors it to stay in its own cluster, or sends it to the other one
+    prediction.data$prediction<- sapply(prediction.data$probs,function(t){
+      return(t<0.5)
+    })
+    #now see if the predictions match the actual clustering
+    prediction.data$match<- sapply(1:nrow(prediction.data),function(k){
+      return(prediction.data$cluster[k]==prediction.data$prediction[k])
+    })
+    #finally write out the updated table file, with match column in it this time
+    write.table(x = prediction.data, file=match.file, quote=FALSE, sep="\t", row.names = FALSE)
+  }
+  #return the filename for the future reuse
+  return(match.file)
+}
+```
+
+Let us do a quick summary over the files and try to plot the data to see how the number of mismatches depends on rsquared value.
+
+```{r exploratory plot for rsquared - mismatches}
+#first we gonna need a function that returns a number of mismatches for a given file
+get.match.percent<- function(match.file){#take care, the function here assumes that the file is given as a full path, not just the filename
+  #first - load the file
+  matches<- fread(input = match.file, sep = "\t", data.table = FALSE, stringsAsFactors = FALSE)
+  #summarize the table to see how many matches and mismatches do we get
+  percent.match<- matches %>% group_by(match) %>% summarize(mismatch=n())
+  #finally return the ratio
+  trues<- as.numeric(percent.match[percent.match$match==TRUE,2])
+  percent.match<- trues/nrow(matches)
+  return(percent.match)
+}
+# a good idea would be to go over the models and append the number of matches to the list of models
+# so let's mark the input files in the model list firs
+
+#now we can go with a regular foreach over the models and get the percent
+registerDoMC(4)
+model.df$match.percent<- foreach(x=model.df$match.file.name, .combine = "c", .errorhandling = "stop")%dopar%{
+  percent.match<- get.match.percent(data.folder(x))
+  return(percent.match)
+}
+#just a quick check, because some of the values are NA, as there may be a case when all matches are FALSE and then it will be NA/nrow(matches),
+if(!assertthat::are_equal(any(is.na(model.df$match.percent)),FALSE)){
+  model.df$match.percent[is.na(model.df$match.percent)]<-1
+}
+#now time to plot
+gp<- ggplot(data=model.df, mapping = aes(x=match.percent, y=rsquared)) + geom_point(color="red") + geom_smooth() + theme_bw()
+gp
+```
+
+I think the trend looks good.
+
+```{r core outsider separation function}
+#here we need a function that takes rsquared and the master.df table, and returns a core-outsider-nonsep table for all genes
+source("R/calculate.clustering.table.R")
+#let's test it  out for rsquared 1
+test.list<- calculate.clustering.table(bh.data = bh.data, rsquared.cutoff = .99, rsquared.table = model.df, legend=legend, processors = 4) #cuz there are in fact no 1 rsquareds, but some are so close, that they are reflected as such
+length(test.list[[1]])
+length(test.list[[2]])
+table(test.list[[1]][[1]]$i.col)
+test.list[[1]][[22]]$j
+table(test.list[[1]][[22]]$i.col)
+```
+
+Seems to work and is pretty fast.. Now we need a function to convert this list into a proper matrix.
+
+```{r matrix conversion function, warning=FALSE}
+source("R/convert.core.list.matrix.R")
+#let's check it out
+test.data.frame<- convert.core.list.matrix(clustering.list = test.list, legend = legend)
+head(test.data.frame)
+```
+
+This finally works. And now we just need a function that summarizes the table and extracts only the core genes.
+
+```{r core extraction function}
+extract.cores<- function(bh.data, core.outsider.df, processors=6, core.number.cutoff=-1, log.file="cluster.log"){
+  cluster <- makeCluster(processors, outfile = log.file)
+  registerDoParallel(cluster)
+  #first summarize the "core.outsider.df""
+  core.outsider.df.summary<- as.data.frame(t(parApply(cl=cluster, X = core.outsider.df, MARGIN = 1, FUN = function(i){
+    sum.core<-length(i[i=="core"])
+    sum.outsider<-length(i[i=="outsider"])
+    sum.nosep<-length(i[i=="nosep"])
+    return(c(core=sum.core, outsider=sum.outsider, nonsep=sum.nosep))
+  })))
+  #do not forget to cluse the cluster
+  stopCluster(cluster)
+  core.outsider.df.summary<- core.outsider.df.summary %>% mutate(names=rownames(core.outsider.df.summary)) %>%
+    filter(outsider==0)
+  if(core.number.cutoff>0){
+     core.outsider.df.summary<-  core.outsider.df.summary %>% filter(core>=core.number.cutoff)
+  }
+  return(core.outsider.df.summary$names)
+}
+#lets check
+test.data.frame.names<- extract.cores(bh.data = bh.data, core.outsider.df= test.data.frame)
+test.data.frame.names[1:10]
+bh.data.cores<-bh.data[test.data.frame.names,]
+head(bh.data.cores)
+```
+
+Well, that takes some time, but it works, which is important). Now we need a function that extracts the mles. The `getMLEs()` function takes a RAW `data.frame`, so we need to cook it first. which is easy in fact.
+
+```{r MLE extraction function}
+#extract mles from the dataframe
+bh.data.cores.mles<- getMLEs(df = expand.df(bh.data.cores))
+bh.data.cores.mles.gprimes<- extract.gprimes(bh.data.cores.mles)
+head(bh.data.cores.mles.gprimes)
+```
+
+Now let's see if these gprimes make any sense. We first convert them into a `dist` object with Euclidean distance, second we will feed the output to `fitch`, third we will visualize the data.
+
+```{r distance calculation and fitch, cache=TRUE}
+#calculate the distance
+bh.data.cores.mles.gprimes.dist<- dist(bh.data.cores.mles.gprimes)
+#run fitch with a bunch of default parameters (need to comment on this a little more explicitly)
+rf<- Rfitch(D=bh.data.cores.mles.gprimes.dist,path = "/usr/local/bin", model="FM", power=2, negative=TRUE, global=FALSE,random.order=FALSE, root=FALSE, quiet=TRUE)
+rf.names<- rename.tree(tree = rf, legend = legend)
+write.tree(phy = rf.names, file = self.dir.folder("test.newick"))
+```
+
+Unfortunately, there is no easy way to plot the `fitch`-generated object, so i guess we are going to use iTOL for that.
+
+```{r itol plotting function, cache=TRUE}
+plot.itol<- function(newick.file, project.name="Default", output.file){
+  #request
+  req<-POST(url = "http://itol.embl.de/batch_uploader.cgi",
+            encode = "multipart", body=list(
+              treeFile=upload_file(newick.file),#the tree itself in newick format
+              treeFormat="newick", #this says that the tree is in newick and is best to indicate explicitly
+              projectName="Default" #just a project name, mandatory though
+            ))
+  id<- str_replace_all(string = str_trim(toString(req)),pattern = "SUCCESS: ", replacement = "")#this is simply to extract the ID from the server responce
+  print(id)
+  #download
+  pl<-POST(url = "http://itol.embl.de/batch_downloader.cgi",
+           encode = "multipart", body=list(
+             tree= id,
+             format="pdf",#we want it in pdf
+             displayMode="unrooted",#we want it in circular and unrooted
+             resolution=300,#print resolution, makes no sence for a vector pdf file, but there might ne smth like fonts for internal nodes, that get rasterized
+             fontSize=48,#this one is the highest number of the font size, otherwise the letters start to overlap
+             lineWidth=1,#this is the line stoke, enough to reflect nicely
+             hideRanges=0,#we do not have any ranges here, so it is good idea to switch this off
+             scaleFactor=0.8#this is the minimum scaling factor, if made smaller, the words begin to overlap (scaling here is the width of the plot if looked at horyzontally)
+           ))
+  #extract the binary object from the responce and save it as pdf (which it is).
+  writeBin(pl$content, con = output.file)
+  return(output.file)
+}
+#let's try if tthe above works as expected
+plot.itol(newick.file = self.dir.folder("test.newick"), output.file = self.dir.folder("test.newick.pdf"))
+```
+<embed src="sliding.rsquared.over.models.output/test.newick.pdf" width="900" height="500" type='application/pdf'/>
+
+Eeeeehm.. unfortunately, iTOL is not capable of producinig a clear image either, so I guess the only option is still [Archaeopteryx](https://aptxevo.wordpress.com/). So, let's keep it simple for now and save only the newicks. Let's check out what the trees will look like when we go over (0,1) rsquared (yes those are curve brackets as I do not think there may exist a true 0 or a true 1 among the models) with a step of 0.1.
+
+```{r sliding over rsquared}
+#create a sequence of rsquared values
+rsquareds<- seq(from=0.1, to=0.99, by=0.98/10)
+processors<- 6
+slide.over.rsquared<- function(rsquareds, cores, legend, bh.data, model.df){
+  output.names<- sapply(rsquareds,function(r){
+    output.name<- self.dir.folder(paste0(r,".rsq.cut.newick"))
+    print(paste("Doing: ",output.name))
+    if(!file.exists(output.name)){
+      print("Clustering list")
+      clustering.list<- calculate.clustering.table(bh.data = bh.data, rsquared.cutoff = r, rsquared.table = model.df, legend = legend, processors = processors)
+      print("Merging clustering list")
+      clustering.table<- convert.core.list.matrix(clustering.list = clustering.list, legend = legend)
+      print("Extracting cores")
+      bh.data.cores<- bh.data[extract.cores(bh.data = bh.data, core.outsider.df = clustering.table, processors = processors),]
+      print("Extracting MLEs")
+      bh.data.cores.mles<- getMLEs(df = expand.df(bh.data.cores))
+      print("Extracting gprimes")
+      bh.data.cores.mles.gprimes<- extract.gprimes(mle.list = bh.data.cores.mles)
+      print("Calculating distance")
+      bh.data.cores.mles.gprimes.dist<- dist(bh.data.cores.mles.gprimes)
+      print("Running fitch")
+      rf<- Rfitch(D=bh.data.cores.mles.gprimes.dist,path = "/usr/local/bin", model="FM", power=2, negative=TRUE, global=FALSE,random.order=FALSE, root=FALSE, quiet=TRUE)
+      print("Renaming edges")
+      rf.names<- rename.tree(tree = rf, legend = legend)
+      print("Saving newick data")
+      write.tree(phy = rf.names, file = output.name)
+    }
+    print(paste("Done: ",output.name))
+    return(output.name)
+  })
+  return(output.names)
+}
+output.names<- slide.over.rsquared(rsquareds = rsquareds, cores = cores, legend=legend, bh.data=bh.data, model.df = model.df)
+```
+
+Ok, we are done, now let's see what we got in the [folder](sliding.rsquared.over.models.output/).
+So, apparently, the best tree in our perception we get when we use **Rsquared in range [0.7,0.78]** as there we see a clean separation between domains. The thing we would like to do now is throw out the *Ichthyophthirius multifiliis* as we had screwd up with his genetic code, and never did a proper conversion for it.
+
+```{r remove Ichthyophthirius multifiliis and Cione intestinalis}
+output.name<- self.dir.folder(paste0("0.78.no.ich.mult.no.ciona",".rsq.cut.newick"))
+print(paste("Doing: ",output.name))
+if(!file.exists(output.name)){
+  print("Clustering list")
+  clustering.list<- calculate.clustering.table(bh.data = bh.data, rsquared.cutoff = 0.78, rsquared.table = model.df, legend = legend, processors = processors)
+  print("Merging clustering list")
+  clustering.table<- convert.core.list.matrix(clustering.list = clustering.list, legend = legend)
+  print("Extracting cores")
+  bh.data.cores<- bh.data[extract.cores(bh.data = bh.data, core.outsider.df = clustering.table, processors = processors),]
+  #remove the Ichthyophthirius multifiliis thing
+  bh.data.cores<- bh.data.cores[!grepl(x = rownames(bh.data.cores), pattern = "\\b40X",fixed = FALSE),-which(colnames(bh.data.cores)=="X40")]
+  bh.data.cores<- bh.data.cores[!grepl(x = rownames(bh.data.cores), pattern = "\\b22X",fixed = FALSE),-which(colnames(bh.data.cores)=="X22")]
+  print("Extracting MLEs")
+  bh.data.cores.mles<- getMLEs(df = expand.df(bh.data.cores))
+  print("Extracting gprimes")
+  bh.data.cores.mles.gprimes<- extract.gprimes(mle.list = bh.data.cores.mles)
+  print("Calculating distance")
+  bh.data.cores.mles.gprimes.dist<- dist(bh.data.cores.mles.gprimes)
+  print("Running fitch")
+  rf<- Rfitch(D=bh.data.cores.mles.gprimes.dist,path = "/usr/local/bin", model="FM", power=2, negative=TRUE, global=FALSE,random.order=FALSE, root=FALSE, quiet=TRUE)
+  print("Renaming edges")
+  rf.names<- rename.tree(tree = rf, legend = legend)
+  print("Saving newick data")
+  write.tree(phy = rf.names, file = output.name)
+  plot.itol(newick.file = output.name, output.file = paste0(output.name,".pdf"))
+}
+print(paste("Done: ",output.name))
+```
+
+##Tightening cores
+
+At this point is seems like I am going to do this a lot, so it makes sense to create a function out of the above boilerplate code. But before all these components go into the `gbra` package, let's see if all works well:
+
+Below we are goingt ot tighten the cores, which means that we are planning ot put a rigid cutoff on the number of times a gene has to be in the core to be considered for future tree prediction. Imgaine a situation, when a gene A has `core, nosep, nosep, nosep`. Technically, that allows it to be a core gene. However, it is drammatically different from the following case: `core, core, core, core`, where the gene is clearly a very specific point in the genome array.
+
+let's use Fibonacci numbers, starting with 2 up to 34.
+
+```{r tightening cores}
+#here goes a function to go over the whole process in one call
+build.tree<- function(bh.data, core.number.cutoff=-1, rsquared.cutoff, rsquared.table, legend, processors, output.name){
+  print(paste("Doing: ",output.name))
+  if(!file.exists(output.name)){
+    print("Clustering list")
+    clustering.list<- calculate.clustering.table(bh.data = bh.data, rsquared.cutoff = rsquared.cutoff, rsquared.table = model.df, legend = legend, processors = processors)
+    print("Merging clustering list")
+    clustering.table<- convert.core.list.matrix(clustering.list = clustering.list, legend = legend)
+    print("Extracting cores")
+    bh.data.cores<- bh.data[extract.cores(bh.data = bh.data, core.number.cutoff=core.number.cutoff, core.outsider.df = clustering.table, processors = processors),]
+    print("Extracting MLEs")
+    bh.data.cores.mles<- getMLEs(df = expand.df(bh.data.cores))
+    print("Extracting gprimes")
+    bh.data.cores.mles.gprimes<- extract.gprimes(mle.list = bh.data.cores.mles)
+    print("Calculating distance")
+    bh.data.cores.mles.gprimes.dist<- dist(bh.data.cores.mles.gprimes)
+    print("Running fitch")
+    rf<- Rfitch(D=bh.data.cores.mles.gprimes.dist,path = "/usr/local/bin", model="FM", power=2, negative=TRUE, global=FALSE,random.order=FALSE, root=FALSE, quiet=TRUE)
+    print("Renaming edges")
+    rf.names<- rename.tree(tree = rf, legend = legend)
+    print("Saving newick data")
+    write.tree(phy = rf.names, file = output.name)
+    plot.itol(newick.file = output.name, output.file = paste0(output.name,".pdf"))
+  }
+  print(paste("Done: ",output.name))
+  return(output.name)
+}
+
+#let's generate the finonacci sequence
+#was lasy, so copypasted from R-bloggers http://www.r-bloggers.com/example-7-1-create-a-fibonacci-sequence/
+len <- 9
+fibvals <- numeric(len)
+fibvals[1] <- 1
+fibvals[2] <- 1
+for (i in 3:len) { 
+   fibvals[i] <- fibvals[i-1]+fibvals[i-2]
+} 
+fibvals<- fibvals[2:length(fibvals)]
+fibvals
+
+#now let's run the function these 5 times..
+rsquared.cutoff<-0.73
+tree.newick.files<- sapply(fibvals, function(f){
+  output.name<- self.dir.folder(paste0("r.",rsquared.cutoff,".corecut.",f,".newick"))
+  if(!file.exists(output.name)){
+    return(build.tree(
+    bh.data = bh.data, core.number.cutoff = f, 
+    rsquared.cutoff = rsquared.cutoff, rsquared.table = model.df, 
+    processors = 6, legend = legend, output.name = output.name))
+  }else{
+      return(output.name)
+  }
+})
+```

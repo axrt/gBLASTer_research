@@ -1,0 +1,61 @@
+---
+title: "Bootstraped Models Evaluation"
+author: "Alexander Tuzhikov"
+date: "October 8, 2016"
+output: 
+  html_document: 
+    fig_caption: yes
+    fig_height: 9
+    fig_width: 12
+    highlight: haddock
+    keep_md: yes
+    number_sections: yes
+    theme: cosmo
+    toc: yes
+---
+
+```{r libs}
+library(dplyr)
+library(ggplot2)
+library(boot)
+library(reshape2)
+source("R/helper.R")
+```
+
+```{r data}
+logreg.model.bootstrap<-function(data, indices, formula){
+  working.data<-data[indices,]
+  glm.fit<-glm(formula = formula, data=working.data, family="binomial")
+  return(glm.fit$coefficients)
+}
+wolbachia.drosophila<- "3_6.rds" %>% sixtyseven.genomes.quadruple.model.bootstrapped %>% readRDS
+boot.model<-boot(wolbachia.drosophila$model, logreg.model.bootstrap, R=1e4, formula=wolbachia.drosophila$formula, parallel = "multicore", ncpus = 12)
+colnames(boot.model$t)<- sapply(names(boot.model$t0), function(x){
+          ret<-legend$name[
+                        which(legend$id_genomes==as.numeric(substr(x,2,nchar(x))))
+                        ]
+        return(ret)
+        })
+boot.model$t %>% head
+boot.model$t[,-1] %>% melt %>% ggplot(., aes(x=Var2, y=value, group=Var2, fill=Var2)) + geom_violin(scale="width")
+boot.model$t[,-1] %>% melt %>% ggplot(., aes(x=Var2, y=value, group=Var2)) + geom_violin(scale="width") +
+        stat_summary(fun.y = "mean", colour = "red", geom="point") + theme(axis.text.x=element_text(hjust=1, angle=45)) -> v.plot
+print(v.plot)
+pdf(file="violin.plot.pdf" %>% sixtyseven.genomes.quadruple.model, width = 25, height=10)
+plot(v.plot)
+dev.off()
+
+boot.model$t[,-1] %>% melt %>% ggplot(., aes(x=Var2, y=value, group=Var2)) + geom_violin(scale="width") +
+        stat_summary(fun.y = "mean", colour = "red", geom="point") + theme(axis.text.x=element_text(hjust=1, angle=45)) + ylim(c(-1000,1000)) -> v.plot
+pdf(file="violin.plot.mean.1000x1000.pdf" %>% sixtyseven.genomes.quadruple.model, width = 25, height=10)
+plot(v.plot)
+dev.off()
+
+boot.model$t[,-1] %>% melt %>% ggplot(., aes(x=Var2, y=value, group=Var2)) + geom_violin(scale="width") +
+        stat_summary(fun.y = "median", colour = "red", geom="point") + theme(axis.text.x=element_text(hjust=1, angle=45)) + ylim(c(-1000,1000)) -> v.plot
+pdf(file="violin.plot.median.1000x1000.pdf" %>% sixtyseven.genomes.quadruple.model, width = 25, height=10)
+plot(v.plot)
+dev.off()
+
+```
+
