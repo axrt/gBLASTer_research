@@ -1,0 +1,12 @@
+if(!require("plyr")){
+        install.packages("plyr")
+        library("plyr")
+}
+if(!require("dplyr")){
+        install.packages("dplyr")
+        library("dplyr")
+}
+if(!require("tidyr")){
+        install.packages("tidyr")
+        library("tidyr")
+}
